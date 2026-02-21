@@ -124,20 +124,27 @@ class VideoRenderer:
         screen_list = self._write_concat_list(self.screen_file, timeline, "screen_h")
         webcam_list = self._write_concat_list(self.webcam_file, timeline, "webcam_h")
 
-        # Позиция PiP-окошка (правый нижний угол)
+        # Позиция PiP-окошка (правый нижний угол с отступами)
         pip_x = config.FORMAT_3["width"]  - config.PIP_WIDTH  - config.PIP_MARGIN_RIGHT
         pip_y = config.FORMAT_3["height"] - config.PIP_HEIGHT - config.PIP_MARGIN_BOTTOM
 
-        # Filtergraph: экран на весь кадр, вебка — скруглённый прямоугольник
-        # Скругление через формат yuva420p + geq для альфа-канала
+        # Filtergraph:
+        #   [0:v] экран → scale 1920×1080 → [bg]
+        #   [1:v] вебка → crop квадрат из центра (1080×1080 из 1920×1080)
+        #               → scale до PIP_SIZE×PIP_SIZE
+        #               → скруглённые углы через geq
+        #               → [pip]
+        #   [bg][pip] → overlay в правый нижний угол
         r = config.PIP_CORNER_RADIUS
-        w, h = config.PIP_WIDTH, config.PIP_HEIGHT
+        s = config.PIP_SIZE          # сторона квадрата
+        # x-offset для центрального кропа из 1920: (1920-1080)/2 = 420
+        crop_offset_x = (1920 - 1080) // 2
         filtergraph = (
             f"[0:v]scale={config.FORMAT_3['width']}:{config.FORMAT_3['height']}[bg];"
-            f"[1:v]scale={w}:{h},format=yuva420p,"
-            f"geq=lum='p(X,Y)':a='if(gt(X,{r})*gt(Y,{r})*lt(X,{w}-{r})*lt(Y,{h}-{r}),255,"
-            f"if(lt(hypot(X-{r},Y-{r}),{r})+lt(hypot(X-{w}+{r},Y-{r}),{r})+"
-            f"lt(hypot(X-{r},Y-{h}+{r}),{r})+lt(hypot(X-{w}+{r},Y-{h}+{r}),{r}),255,0))'[pip];"
+            f"[1:v]crop=1080:1080:{crop_offset_x}:0,scale={s}:{s},format=yuva420p,"
+            f"geq=lum='p(X,Y)':a='if(gt(X,{r})*gt(Y,{r})*lt(X,{s}-{r})*lt(Y,{s}-{r}),255,"
+            f"if(lt(hypot(X-{r},Y-{r}),{r})+lt(hypot(X-{s}+{r},Y-{r}),{r})+"
+            f"lt(hypot(X-{r},Y-{s}+{r}),{r})+lt(hypot(X-{s}+{r},Y-{s}+{r}),{r}),255,0))'[pip];"
             f"[bg][pip]overlay={pip_x}:{pip_y}[out]"
         )
 
