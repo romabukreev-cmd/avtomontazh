@@ -1,0 +1,11 @@
+# Транскрипция речи
+openai-whisper
+
+# Telegram-бот
+python-telegram-bot>=20.0
+
+# HTTP запросы к OpenRouter API
+httpx
+
+# Работа с переменными окружения (.env файл)
+python-dotenv
