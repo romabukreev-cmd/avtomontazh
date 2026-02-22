@@ -23,9 +23,10 @@ LOGS_DIR   = BASE_DIR / "logs"
 # ─── Именование файлов внутри сессии ─────────────────────────────────────────
 
 # Glob-паттерны для поиска файлов внутри папки сессии
-# Ожидаемый формат: screen_001.mp4, screen_002.mp4 / webcam_001.mp4, webcam_002.mp4
-SCREEN_FILE_PATTERN = "screen_*.mp4"
-WEBCAM_FILE_PATTERN = "webcam_*.mp4"
+# Ожидаемый формат: screen_001.mp4/.mkv, webcam_001.mp4/.mkv и т.д.
+SCREEN_FILE_PATTERN = "screen_*"
+WEBCAM_FILE_PATTERN = "webcam_*"
+VIDEO_EXTENSIONS    = {".mp4", ".mkv", ".avi", ".mov", ".ts"}
 
 # ─── Whisper (транскрипция) ───────────────────────────────────────────────────
 

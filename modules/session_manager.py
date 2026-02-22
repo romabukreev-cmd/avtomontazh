@@ -123,7 +123,10 @@ class SessionManager:
         Находит файлы по glob-паттерну и сортирует по числовому суффиксу.
         screen_001.mp4 < screen_002.mp4 < screen_010.mp4 (числовая, не лексикографическая)
         """
-        files = list(directory.glob(pattern))
+        files = [
+            f for f in directory.glob(pattern)
+            if f.suffix.lower() in config.VIDEO_EXTENSIONS
+        ]
         files.sort(key=lambda f: self._extract_number(f.stem))
         return files
 
