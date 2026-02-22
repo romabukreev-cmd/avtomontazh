@@ -209,9 +209,19 @@ class AutomontazhBot:
             except Exception:
                 pass  # сообщение могло не измениться (Telegram возвращает ошибку)
 
+        # Синхронная обёртка для передачи в поток (пайплайн синхронный, бот — async)
+        loop = asyncio.get_running_loop()
+
+        def sync_progress(text: str) -> None:
+            future = asyncio.run_coroutine_threadsafe(progress(text), loop)
+            try:
+                future.result(timeout=5)
+            except Exception:
+                pass
+
         # Запускаем тяжёлый пайплайн в отдельном потоке (не блокируем event loop)
         try:
-            await asyncio.to_thread(self.pipeline_fn, session, progress)
+            await asyncio.to_thread(self.pipeline_fn, session, sync_progress)
 
             # Загружаем результаты на Яндекс Диск
             await progress("📤 Загружаю результаты на Яндекс Диск...")

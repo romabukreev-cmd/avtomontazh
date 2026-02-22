@@ -10,7 +10,6 @@ main.py — точка входа системы Автомонтаж.
   - Присылает прогресс и уведомление о завершении
 """
 
-import asyncio
 import logging
 import sys
 from typing import Callable
@@ -35,27 +34,17 @@ def process_session(session: Session, progress: Callable) -> None:
     Полный цикл обработки одной сессии.
     Принимает Session с набором файлов — создаёт три готовых видео.
 
-    progress — coroutine-функция для отправки сообщений в Telegram.
-    Вызывается через asyncio.run_coroutine_threadsafe() т.к. пайплайн синхронный.
+    progress — синхронная функция для отправки сообщений в Telegram.
+    Thread-safe обёртка создаётся в bot.py перед запуском потока.
     """
     log = logging.getLogger(f"session.{session.name}")
     log.info(f"▶  Начало обработки: {session.name} ({session.file_count} файлов)")
-
-    # Синхронная обёртка для прогресса (пайплайн синхронный, бот — async)
-    event_loop = asyncio.get_event_loop()
-
-    def send(text: str) -> None:
-        future = asyncio.run_coroutine_threadsafe(progress(text), event_loop)
-        try:
-            future.result(timeout=5)
-        except Exception:
-            pass  # не блокируем пайплайн если бот недоступен
 
     # ── Шаг 0: Конкатенация файлов (если несколько) ───────────────────────────
     # Если OBS создал несколько файлов (паузы) — склеиваем их в один поток.
     # session_manager делает это через FFmpeg concat без перекодирования.
 
-    send(
+    progress(
         f"▶ <b>{session.name}</b>\n\n"
         f"⏳ Подготовка файлов ({session.file_count} частей)..."
     )
@@ -68,7 +57,7 @@ def process_session(session: Session, progress: Callable) -> None:
     # Whisper транскрибирует аудио записи экрана.
     # Возвращает список сегментов речи с таймстемпами (паузы > 1.5с удалены).
 
-    send(
+    progress(
         f"▶ <b>{session.name}</b>\n\n"
         "✅ Файлы готовы\n"
         "⏳ Транскрибирую аудио через Whisper...\n"
@@ -84,7 +73,7 @@ def process_session(session: Session, progress: Callable) -> None:
     # Транскрипция отправляется в LLM (OpenRouter).
     # LLM оценивает каждый сегмент и помечает: оставить или вырезать.
 
-    send(
+    progress(
         f"▶ <b>{session.name}</b>\n\n"
         "✅ Файлы готовы\n"
         f"✅ Транскрипция: {len(speech_segments)} сегментов ({format_duration(total_speech)})\n"
@@ -102,7 +91,7 @@ def process_session(session: Session, progress: Callable) -> None:
     #   - длинный (все отобранные сегменты, до 10 минут)
     #   - хайлайты (лучшие по оценке, до 3 минут, хронологически)
 
-    send(
+    progress(
         f"▶ <b>{session.name}</b>\n\n"
         "✅ Файлы готовы\n"
         f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
@@ -129,7 +118,7 @@ def process_session(session: Session, progress: Callable) -> None:
         """Фабрика колбэка прогресса рендера для каждого формата."""
         def cb(pct: float) -> None:
             bar = "▓" * int(pct / 10) + "░" * (10 - int(pct / 10))
-            send(
+            progress(
                 f"▶ <b>{session.name}</b>\n\n"
                 "✅ Файлы готовы\n"
                 f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
