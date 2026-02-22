@@ -157,7 +157,7 @@ TELEGRAM_ALLOWED_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 RCLONE_REMOTE_NAME = "yadisk"
 
 # Путь на Яндекс Диске откуда скачиваются исходные файлы
-RCLONE_YD_INPUT_PATH = "Автомонтаж/input"
+RCLONE_YD_INPUT_PATH = "PROJECTS/Автомонтаж/input"
 
 # Путь на Яндекс Диске куда загружаются готовые видео
-RCLONE_YD_OUTPUT_PATH = "Автомонтаж/output"
+RCLONE_YD_OUTPUT_PATH = "PROJECTS/Автомонтаж/output"
