@@ -49,7 +49,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 # Модель для анализа транскрипции
 # Хорошие варианты: "anthropic/claude-3.5-sonnet", "openai/gpt-4o-mini", "google/gemini-flash-1.5"
-LLM_MODEL = "anthropic/claude-3.5-sonnet"
+LLM_MODEL = "google/gemini-flash-1.5"
 
 # Сколько токенов транскрипции отправлять за раз (у длинных видео транскрипция большая)
 LLM_CHUNK_SIZE_TOKENS = 8000
