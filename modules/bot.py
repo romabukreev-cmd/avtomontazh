@@ -49,7 +49,7 @@ class AutomontazhBot:
 
     # ── Запуск бота ───────────────────────────────────────────────────────────
 
-    async def run(self) -> None:
+    def run(self) -> None:
         """Запускает бота в режиме polling. Блокирует до Ctrl+C."""
         app = (
             Application.builder()
@@ -67,7 +67,8 @@ class AutomontazhBot:
         app.add_handler(CallbackQueryHandler(self._on_session_selected, pattern="^process:"))
 
         log.info("Telegram-бот запущен. Жду команды...")
-        await app.run_polling(allowed_updates=Update.ALL_TYPES)
+        # run_polling() сам управляет event loop — не оборачивать в asyncio.run()
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
     # ── Команды ───────────────────────────────────────────────────────────────
 

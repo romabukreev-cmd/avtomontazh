@@ -176,7 +176,7 @@ def process_session(session: Session, progress: Callable) -> None:
 #  ТОЧКА ВХОДА
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def main() -> None:
+def main() -> None:
     setup_logging(config.LOGS_DIR, level=config.LOG_LEVEL)
     log = logging.getLogger("main")
 
@@ -203,8 +203,8 @@ async def main() -> None:
     log.info("═" * 55)
 
     bot = AutomontazhBot(pipeline_fn=process_session)
-    await bot.run()
+    bot.run()  # run_polling() управляет event loop сам
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
