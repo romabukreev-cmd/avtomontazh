@@ -156,7 +156,7 @@ TELEGRAM_ALLOWED_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 RCLONE_REMOTE_NAME = "gdrive"
 
 # Путь на Google Drive откуда скачиваются исходные файлы
-RCLONE_YD_INPUT_PATH = "Автомонтаж/input"
+RCLONE_YD_INPUT_PATH = "PROJECTS/Автомонтаж/input"
 
 # Путь на Google Drive куда загружаются готовые видео
-RCLONE_YD_OUTPUT_PATH = "Автомонтаж/output"
+RCLONE_YD_OUTPUT_PATH = "PROJECTS/Автомонтаж/output"
