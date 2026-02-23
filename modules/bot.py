@@ -66,9 +66,11 @@ class AutomontazhBot:
         app.add_handler(CommandHandler("sessions", self._cmd_sessions))
         app.add_handler(CommandHandler("status",   self._cmd_status))
         app.add_handler(CommandHandler("cancel",   self._cmd_cancel))
+        app.add_handler(CommandHandler("reset",    self._cmd_reset))
 
-        # Обработчик нажатий на inline-кнопки (выбор сессии)
+        # Обработчик нажатий на inline-кнопки (выбор сессии / сброс)
         app.add_handler(CallbackQueryHandler(self._on_session_selected, pattern="^process:"))
+        app.add_handler(CallbackQueryHandler(self._on_reset_selected,   pattern="^reset:"))
 
         log.info("Telegram-бот запущен. Жду команды...")
         # run_polling() сам управляет event loop — не оборачивать в asyncio.run()
@@ -86,7 +88,8 @@ class AutomontazhBot:
             "/sync — скачать новые файлы с Google Drive\n"
             "/sessions — показать сессии для обработки\n"
             "/status — статус обработки\n"
-            "/cancel — остановить текущую обработку\n\n"
+            "/cancel — остановить текущую обработку\n"
+            "/reset — сбросить незавершённую сессию (удалить частичный output)\n\n"
             "Перед первым запуском выполни /sync чтобы скачать файлы."
         )
         await update.message.reply_text(text)
@@ -275,13 +278,80 @@ class AutomontazhBot:
             await update.message.reply_text("Ничего не обрабатывается.")
             return
 
+        session_name = self.current_session
         await update.message.reply_text(
-            f"⛔ Останавливаю обработку <b>{self.current_session}</b>...\n"
+            f"⛔ Останавливаю обработку <b>{session_name}</b>...\n"
             "Бот перезапустится через несколько секунд.",
             parse_mode="HTML"
         )
+
+        # Удаляем частичный output чтобы сессия не считалась обработанной
+        if session_name:
+            import shutil
+            output_path = config.OUTPUT_DIR / session_name
+            if output_path.exists():
+                shutil.rmtree(output_path)
+                log.info(f"/cancel: удалён частичный output: {output_path}")
+
         log.warning("Получена команда /cancel — завершаю процесс.")
         os.kill(os.getpid(), signal.SIGTERM)
+
+    async def _cmd_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показывает сессии с незавершённым output для сброса."""
+        if not self._is_allowed(update):
+            return
+
+        if self.is_processing:
+            await update.message.reply_text(
+                f"⏳ Сейчас идёт обработка: <b>{self.current_session}</b>\n"
+                "Используй /cancel чтобы остановить её.",
+                parse_mode="HTML"
+            )
+            return
+
+        if not config.OUTPUT_DIR.exists():
+            await update.message.reply_text("Нет незавершённых сессий.")
+            return
+
+        sessions_with_output = sorted(
+            d for d in config.OUTPUT_DIR.iterdir() if d.is_dir()
+        )
+
+        if not sessions_with_output:
+            await update.message.reply_text("Нет незавершённых сессий.")
+            return
+
+        keyboard = [
+            [InlineKeyboardButton(f"🗑 {d.name}", callback_data=f"reset:{d.name}")]
+            for d in sessions_with_output
+        ]
+        await update.message.reply_text(
+            "Выбери сессию для сброса.\n"
+            "Удалит output-файлы — входные файлы останутся, можно запустить заново:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def _on_reset_selected(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Удаляет output-папку выбранной сессии."""
+        query = update.callback_query
+        await query.answer()
+        if not self._is_allowed(update):
+            return
+
+        import shutil
+        session_name = query.data.replace("reset:", "")
+        output_path  = config.OUTPUT_DIR / session_name
+
+        if output_path.exists():
+            shutil.rmtree(output_path)
+            log.info(f"/reset: удалён output: {output_path}")
+            await query.edit_message_text(
+                f"✅ Сессия <b>{session_name}</b> сброшена.\n"
+                "Запусти обработку заново через /sessions.",
+                parse_mode="HTML"
+            )
+        else:
+            await query.edit_message_text(f"Папка <b>{session_name}</b> не найдена.", parse_mode="HTML")
 
     def _run_rclone_sync(self) -> None:
         """Запускает rclone sync: Google Drive → локальная папка input/."""
