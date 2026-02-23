@@ -150,13 +150,13 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # Бот будет отвечать ТОЛЬКО этому пользователю (защита)
 TELEGRAM_ALLOWED_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 
-# ─── Яндекс Диск (rclone) ────────────────────────────────────────────────────
+# ─── Google Drive (rclone) ───────────────────────────────────────────────────
 
 # Имя remote в rclone config (задаётся при настройке rclone)
-RCLONE_REMOTE_NAME = "yadisk"
+RCLONE_REMOTE_NAME = "gdrive"
 
-# Путь на Яндекс Диске откуда скачиваются исходные файлы
-RCLONE_YD_INPUT_PATH = "PROJECTS/Автомонтаж/input"
+# Путь на Google Drive откуда скачиваются исходные файлы
+RCLONE_YD_INPUT_PATH = "Автомонтаж/input"
 
-# Путь на Яндекс Диске куда загружаются готовые видео
-RCLONE_YD_OUTPUT_PATH = "PROJECTS/Автомонтаж/output"
+# Путь на Google Drive куда загружаются готовые видео
+RCLONE_YD_OUTPUT_PATH = "Автомонтаж/output"
