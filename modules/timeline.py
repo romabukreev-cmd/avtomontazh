@@ -3,37 +3,48 @@ timeline.py — построение финального таймлайна и�
 
 Логика для длинного таймлайна (Форматы 1 и 3, до 10 минут):
   1. Берём все keep=True сегменты в хронологическом порядке
-  2. Объединяем соседние сегменты если между ними < 0.5 секунды (зазор)
-  3. Суммарная длительность: если > 10 минут — обрезаем хвост
+  2. Объединяем соседние сегменты если между ними < 0.5 секунды
+  3. Если суммарная длительность > max_sec — удаляем наименее важные сегменты
+     из СЕРЕДИНЫ, защищая первые и последние 15% (сохраняем начало и конец)
 
 Логика для хайлайтов (Формат 2, до 3 минут):
-  1. Сортируем keep=True сегменты по score (от высокого к низкому)
-  2. Берём лучшие пока сумма не превысит 3 минуты
-  3. Сортируем выбранные обратно в хронологический порядок (важно для восприятия!)
+  Используется результат второго LLM-прохода (analyze_highlights).
+  Строим из keep=True сегментов в хронологическом порядке.
+
+Padding:
+  Каждый отрезок расширяется на 0.5с с обеих сторон — берём кусок тишины
+  вокруг речи. Это обеспечивает "воздух" между склейками.
 
 Результат — список временны́х отрезков [{start, end}], готовый для renderer.py
 """
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
 # Два соседних сегмента с зазором меньше этого значения объединяются в один
 _MERGE_GAP_SEC = 0.5
 
-# Минимальный балл для попадания в хайлайты (если LLM вернул keep=True но балл низкий)
-_HIGHLIGHT_MIN_SCORE = 0.0  # берём все keep=True, сортируем по score
+# Padding вокруг каждого отрезка (тишина перед и после речи)
+_PRE_ROLL_SEC  = 0.5
+_POST_ROLL_SEC = 0.5
+
+# Доля сегментов защищённых от удаления (начало и конец видео)
+_PROTECT_FRACTION = 0.15
 
 
 class TimelineBuilder:
 
-    def build_long(self, segments: List[Dict], max_sec: float) -> List[Dict]:
+    def build_long(self, segments: List[Dict], max_sec: float,
+                   video_duration: Optional[float] = None) -> List[Dict]:
         """
         Строит таймлайн для длинного видео (до max_sec секунд).
 
-        Принимает scored_segments (с полями keep, score, start, end).
-        Возвращает: [{"start": 0.0, "end": 12.4}, ...]
+        Если отобранного контента больше max_sec — удаляет наименее важные
+        сегменты из середины, сохраняя начало и конец.
+
+        video_duration — длина исходного видео для ограничения padding.
         """
         kept = [s for s in segments if s.get("keep", False)]
         if not kept:
@@ -41,52 +52,37 @@ class TimelineBuilder:
             return []
 
         kept.sort(key=lambda s: s["start"])
-        merged  = self._merge_close(kept)
-        trimmed = self._trim_to_duration(merged, max_sec)
+        merged = self._merge_close(kept)
 
-        actual = self.total_duration(trimmed)
-        log.info(f"Длинный таймлайн: {len(trimmed)} отрезков, {actual:.1f}с")
-        return trimmed
+        # Если превышаем лимит — убираем наименее важные из середины
+        total = self.total_duration(merged)
+        if total > max_sec:
+            merged = self._prune_by_priority(merged, max_sec)
 
-    def build_highlights(self, segments: List[Dict], max_sec: float) -> List[Dict]:
+        padded = self._add_padding(merged, video_duration)
+
+        actual = self.total_duration(padded)
+        log.info(f"Длинный таймлайн: {len(padded)} отрезков, {actual:.1f}с")
+        return padded
+
+    def build_highlights(self, segments: List[Dict],
+                         video_duration: Optional[float] = None) -> List[Dict]:
         """
-        Строит таймлайн из лучших моментов (до max_sec секунд).
-
-        Алгоритм:
-          1. Сортируем по score убыванию
-          2. Жадно берём сегменты пока не наберём max_sec
-          3. Возвращаем в хронологическом порядке
+        Строит таймлайн из сегментов прошедших второй LLM-проход (analyze_highlights).
+        Просто берём keep=True в хронологическом порядке.
         """
         kept = [s for s in segments if s.get("keep", False)]
         if not kept:
             log.warning("build_highlights: нет ни одного keep=True сегмента")
             return []
 
-        # Сортируем по убыванию score
-        by_score = sorted(kept, key=lambda s: s.get("score", 0.0), reverse=True)
+        kept.sort(key=lambda s: s["start"])
+        merged = self._merge_close(kept)
+        padded = self._add_padding(merged, video_duration)
 
-        selected = []
-        total = 0.0
-        for seg in by_score:
-            dur = seg["end"] - seg["start"]
-            if total + dur > max_sec:
-                # Можем взять только кусок чтобы не превысить лимит
-                remaining = max_sec - total
-                if remaining > 1.0:  # стоит только если > 1 секунды
-                    selected.append({
-                        "start": seg["start"],
-                        "end":   round(seg["start"] + remaining, 3),
-                    })
-                break
-            selected.append({"start": seg["start"], "end": seg["end"]})
-            total += dur
-
-        # Восстанавливаем хронологический порядок
-        selected.sort(key=lambda s: s["start"])
-
-        actual = self.total_duration(selected)
-        log.info(f"Хайлайты: {len(selected)} отрезков, {actual:.1f}с")
-        return selected
+        actual = self.total_duration(padded)
+        log.info(f"Хайлайты: {len(padded)} отрезков, {actual:.1f}с")
+        return padded
 
     def total_duration(self, timeline: List[Dict]) -> float:
         """Возвращает суммарную длительность таймлайна в секундах."""
@@ -94,42 +90,90 @@ class TimelineBuilder:
 
     # ── Вспомогательные методы ────────────────────────────────────────────────
 
+    def _prune_by_priority(self, segments: List[Dict], max_sec: float) -> List[Dict]:
+        """
+        Удаляет наименее важные сегменты из середины пока total ≤ max_sec.
+        Первые и последние _PROTECT_FRACTION сегментов защищены от удаления.
+        """
+        n = len(segments)
+        protect_n = max(1, int(n * _PROTECT_FRACTION))
+
+        protected_idx = set(range(protect_n)) | set(range(n - protect_n, n))
+        middle = [(i, s) for i, s in enumerate(segments) if i not in protected_idx]
+
+        # Сортируем кандидатов на удаление по score возрастанию
+        middle.sort(key=lambda x: x[1].get("score", 0.0))
+
+        to_remove: set = set()
+        total = self.total_duration(segments)
+
+        for i, seg in middle:
+            if total <= max_sec:
+                break
+            dur = seg["end"] - seg["start"]
+            to_remove.add(i)
+            total -= dur
+
+        result = [s for i, s in enumerate(segments) if i not in to_remove]
+        log.info(f"_prune_by_priority: убрано {len(to_remove)} сегментов из середины, осталось {len(result)}")
+        return result
+
     def _merge_close(self, segments: List[Dict]) -> List[Dict]:
         """
         Объединяет соседние сегменты с зазором меньше _MERGE_GAP_SEC.
+        Сохраняет score как максимум из объединяемых сегментов.
         Входные сегменты должны быть отсортированы по start.
         """
         if not segments:
             return []
 
-        merged = [{"start": segments[0]["start"], "end": segments[0]["end"]}]
+        merged = [{
+            "start": segments[0]["start"],
+            "end":   segments[0]["end"],
+            "score": segments[0].get("score", 0.5),
+        }]
 
         for seg in segments[1:]:
             gap = seg["start"] - merged[-1]["end"]
             if gap <= _MERGE_GAP_SEC:
-                # Расширяем последний отрезок
-                merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
+                merged[-1]["end"]   = max(merged[-1]["end"], seg["end"])
+                merged[-1]["score"] = max(merged[-1]["score"], seg.get("score", 0.5))
             else:
-                merged.append({"start": seg["start"], "end": seg["end"]})
+                merged.append({
+                    "start": seg["start"],
+                    "end":   seg["end"],
+                    "score": seg.get("score", 0.5),
+                })
 
         return merged
 
-    def _trim_to_duration(self, timeline: List[Dict], max_sec: float) -> List[Dict]:
+    def _add_padding(self, timeline: List[Dict],
+                     video_duration: Optional[float]) -> List[Dict]:
         """
-        Обрезает таймлайн до max_sec секунд.
-        Последний отрезок может быть обрезан частично.
+        Расширяет каждый отрезок на PRE_ROLL_SEC назад и POST_ROLL_SEC вперёд.
+        Обеспечивает "воздух" вокруг речи — звук начинается не с первого сэмпла.
+        Соседние расширенные отрезки объединяются если пересекаются.
         """
-        result = []
-        total  = 0.0
+        if not timeline:
+            return []
 
+        max_end = video_duration if video_duration else float("inf")
+
+        padded = []
         for seg in timeline:
-            dur = seg["end"] - seg["start"]
-            if total + dur >= max_sec:
-                # Берём только нужную часть последнего отрезка
-                cut_end = seg["start"] + (max_sec - total)
-                result.append({"start": seg["start"], "end": round(cut_end, 3)})
-                break
-            result.append({"start": seg["start"], "end": seg["end"]})
-            total += dur
+            padded.append({
+                "start": max(0.0, seg["start"] - _PRE_ROLL_SEC),
+                "end":   min(max_end, seg["end"] + _POST_ROLL_SEC),
+                "score": seg.get("score", 0.5),
+            })
 
-        return result
+        # Объединяем пересекающиеся отрезки после расширения
+        merged = [padded[0]]
+        for seg in padded[1:]:
+            if seg["start"] <= merged[-1]["end"]:
+                merged[-1]["end"]   = max(merged[-1]["end"], seg["end"])
+                merged[-1]["score"] = max(merged[-1]["score"], seg["score"])
+            else:
+                merged.append(seg)
+
+        return merged

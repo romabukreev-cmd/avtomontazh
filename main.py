@@ -89,7 +89,7 @@ def process_session(session: Session, progress: Callable) -> None:
     # ── Шаг 3: Построение таймлайна ───────────────────────────────────────────
     # TimelineBuilder собирает два списка отрезков:
     #   - длинный (все отобранные сегменты, до 10 минут)
-    #   - хайлайты (лучшие по оценке, до 3 минут, хронологически)
+    #   - хайлайты (второй LLM-проход по длинным сегментам, до 3 минут)
 
     progress(
         f"▶ <b>{session.name}</b>\n\n"
@@ -98,12 +98,59 @@ def process_session(session: Session, progress: Callable) -> None:
         f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
         "⏳ Строю таймлайн..."
     )
+
+    # Длительность исходного видео (для корректного padding в timeline builder)
+    import subprocess as _sp
+    _probe = _sp.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(screen_file)],
+        capture_output=True, text=True,
+    )
+    try:
+        video_duration = float(_probe.stdout.strip())
+    except ValueError:
+        video_duration = None
+
     builder = TimelineBuilder()
-    timeline_long      = builder.build_long(kept, max_sec=config.FORMAT_1["max_duration_sec"])
-    timeline_highlight = builder.build_highlights(kept, max_sec=config.FORMAT_2["max_duration_sec"])
+    timeline_long = builder.build_long(
+        kept,
+        max_sec=config.FORMAT_1["max_duration_sec"],
+        video_duration=video_duration,
+    )
     dur_long = builder.total_duration(timeline_long)
-    dur_hl   = builder.total_duration(timeline_highlight)
-    log.info(f"Таймлайн: длинный {format_duration(dur_long)}, хайлайты {format_duration(dur_hl)}")
+    log.info(f"Длинный таймлайн: {format_duration(dur_long)}")
+
+    # Второй LLM-проход: выбираем хайлайты из уже отобранных сегментов длинного таймлайна
+    # Для этого берём scored_segments чьи временные отрезки вошли в timeline_long
+    long_start_ends = {(round(s["start"], 1), round(s["end"], 1)) for s in timeline_long}
+    long_segments = [
+        s for s in kept
+        if any(
+            s["start"] >= ts - 0.6 and s["end"] <= te + 0.6
+            for ts, te in long_start_ends
+        )
+    ]
+    if not long_segments:
+        long_segments = kept  # fallback
+
+    progress(
+        f"▶ <b>{session.name}</b>\n\n"
+        "✅ Файлы готовы\n"
+        f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
+        f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
+        f"✅ Длинный таймлайн: {format_duration(dur_long)}\n"
+        "⏳ AI выбирает хайлайты (3 мин)..."
+    )
+    highlights_scored = analyzer.analyze_highlights(
+        long_segments,
+        max_sec=config.FORMAT_2["max_duration_sec"],
+    )
+    timeline_highlight = builder.build_highlights(
+        highlights_scored,
+        video_duration=video_duration,
+    )
+    dur_hl = builder.total_duration(timeline_highlight)
+    log.info(f"Хайлайты: {format_duration(dur_hl)}")
 
 
     # ── Шаг 4: Рендер трёх форматов ───────────────────────────────────────────

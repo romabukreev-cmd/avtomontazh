@@ -89,6 +89,9 @@ class VideoRenderer:
             "[top][bot]vstack[out]"
         )
 
+        audio_fade = self._build_audio_fade_filter(timeline)
+        filtergraph += f";[0:a]{audio_fade}[aout]"
+
         total_duration = sum(s["end"] - s["start"] for s in timeline)
         cmd = [
             "ffmpeg", "-y",
@@ -96,7 +99,7 @@ class VideoRenderer:
             "-f", "concat", "-safe", "0", "-i", str(webcam_list),
             "-filter_complex", filtergraph,
             "-map", "[out]",
-            "-map", "0:a",              # аудио из записи экрана
+            "-map", "[aout]",
             "-c:v", config.VIDEO_CODEC,
             "-crf", str(config.VIDEO_CRF),
             "-preset", config.VIDEO_PRESET,
@@ -165,6 +168,9 @@ class VideoRenderer:
             f"[bg][pip]overlay={pip_x}:{pip_y}[out]"
         )
 
+        audio_fade = self._build_audio_fade_filter(timeline)
+        filtergraph += f";[0:a]{audio_fade}[aout]"
+
         total_duration = sum(s["end"] - s["start"] for s in timeline)
         cmd = [
             "ffmpeg", "-y",
@@ -172,7 +178,7 @@ class VideoRenderer:
             "-f", "concat", "-safe", "0", "-i", str(webcam_list),
             "-filter_complex", filtergraph,
             "-map", "[out]",
-            "-map", "0:a",
+            "-map", "[aout]",
             "-c:v", config.VIDEO_CODEC,
             "-crf", str(config.VIDEO_CRF),
             "-preset", config.VIDEO_PRESET,
@@ -261,6 +267,41 @@ class VideoRenderer:
                 pass
 
         log.debug(f"FFmpeg завершён успешно")
+
+    def _build_audio_fade_filter(self, timeline: List[Dict]) -> str:
+        """
+        Строит цепочку afade-фильтров для плавного звука на всех стыках склейки.
+
+        Для каждой точки склейки добавляет:
+          - fade-out 0.5с перед стыком
+          - fade-in  0.5с после стыка
+        Плюс fade-in в начале и fade-out в конце всего ролика.
+
+        Результат: 'afade=t=in:st=0:d=0.5,afade=t=out:st=9.5:d=0.5,...'
+        """
+        d = 0.5  # длительность fade в секундах
+        fades = []
+
+        # Fade-in в начале
+        fades.append(f"afade=t=in:st=0:d={d}")
+
+        # Вычисляем позиции стыков в выходном потоке
+        t = 0.0
+        for i, seg in enumerate(timeline):
+            dur = seg["end"] - seg["start"]
+            t += dur
+            if i < len(timeline) - 1:
+                # Fade-out перед стыком
+                fade_out_st = max(0.0, t - d)
+                fades.append(f"afade=t=out:st={fade_out_st:.3f}:d={d}")
+                # Fade-in после стыка
+                fades.append(f"afade=t=in:st={t:.3f}:d={d}")
+
+        # Fade-out в конце
+        fade_out_st = max(0.0, t - d)
+        fades.append(f"afade=t=out:st={fade_out_st:.3f}:d={d}")
+
+        return ",".join(fades)
 
     def cleanup_temp(self) -> None:
         """Удаляет все временные файлы, созданные при рендере."""

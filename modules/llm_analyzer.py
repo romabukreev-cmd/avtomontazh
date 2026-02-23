@@ -1,17 +1,14 @@
 """
 llm_analyzer.py — анализ транскрипции через LLM (OpenRouter API).
 
-Логика:
-  1. Берём список сегментов от Transcriber
-  2. Разбиваем на чанки если транскрипция очень длинная (>8000 токенов)
-  3. Отправляем каждый чанк в LLM с инструкцией:
-     - Оцени каждый сегмент по 0..1 (насколько это интересный дизайн-процесс)
-     - Пометь keep=True если score >= 0.5
-  4. Склеиваем результаты чанков обратно
-  5. При ошибке API — повторяем до LLM_MAX_RETRIES раз
-
-Формат ответа LLM (JSON):
-  {"segments": [{"index": 0, "score": 0.9, "keep": true, "reason": "..."}, ...]}
+Два прохода:
+  1. analyze(segments) — полный анализ всей транскрипции:
+       - оценивает важность каждого сегмента (score 0..1)
+       - удаляет незаконченные мысли и фальстарты
+       - результат используется для 10-минутных версий
+  2. analyze_highlights(segments, max_sec) — второй проход для 3-минутной версии:
+       - принимает уже отфильтрованные сегменты из 10-мин таймлайна
+       - просит LLM выбрать лучшие max_sec секунд как самостоятельный ролик
 """
 
 import json
@@ -26,8 +23,8 @@ import config
 
 log = logging.getLogger(__name__)
 
-# Минимальный балл для keep=True (если LLM вернул keep=True, но score ниже — перезаписываем)
 _KEEP_THRESHOLD = 0.5
+
 
 def _build_system_prompt() -> str:
     return f"""Ты — опытный видеомонтажёр для YouTube. Тебе дана ПОЛНАЯ транскрипция видео.
@@ -35,45 +32,100 @@ def _build_system_prompt() -> str:
 КОНТЕКСТ ВИДЕО:
 {config.VIDEO_CONTEXT}
 
-ГЛАВНЫЙ ПРИНЦИП — СОХРАНИ ЛОГИЧЕСКУЮ ДУГУ:
-Финальное видео должно иметь начало, середину и конец — как в оригинале.
-- Начало: оставляй с ПЕРВОЙ ОСМЫСЛЕННОЙ ФРАЗЫ (не с первой секунды!).
-  Вначале может быть пауза (автор включает запись), запинки — всё это удаляй.
-  Сохрани первый сегмент, где автор начинает говорить связно.
-- Конец видео — сохраняй финальные осмысленные фразы и результат работы.
-- Середину — сжимай, оставляя ключевые моменты из КАЖДОЙ части процесса.
-- Цель: финальное видео = 40–60% от оригинала по времени.
+═══════════════════════════════════════════════
+ГЛАВНЫЙ ПРИНЦИП — СОХРАНИ ЛОГИЧЕСКУЮ ДУГУ
+═══════════════════════════════════════════════
+Финальное видео должно иметь начало, середину и конец.
+Цель: финальное видео = 40–60% от оригинала.
 
-ОБЯЗАТЕЛЬНО УДАЛЯЙ:
-1. ПОВТОРЫ ФРАЗ — если автор запнулся и повторяет фразу заново:
-   - "Сейчас я... Сейчас я буду делать анимацию" → keep=false для первого, keep=true для второго
-   - Оставляй только последнюю, завершённую версию фразы
-2. ПАУЗЫ И МУСОР — молчание, бормотание, "эм", "ну", незаконченные мысли
-3. ТЕХНИЧЕСКИЕ ОЖИДАНИЯ — загрузка файлов, ожидание рендера, зависания
-4. НЕРЕЛЕВАНТНЫЕ ОТСТУПЛЕНИЯ — разговоры не по теме работы
+НАЧАЛО: оставляй с первой фразы где автор говорит связно и по делу.
+  Удаляй: паузы перед стартом, запинки, незаконченные вступления.
+  Первый keep=true сегмент — это начало ролика.
 
-ОСТАВЛЯЙ:
-- Объяснение того, что делает автор
+КОНЕЦ: последние 3–5 сегментов — почти всегда keep=true.
+  Зритель должен увидеть финальный результат и завершающую мысль.
+  Не обрезай конец — это критически важно.
+
+СЕРЕДИНА: сжимай, оставляя ключевые моменты из каждого этапа процесса.
+
+═══════════════════════════════════════════════
+ПРАВИЛА УДАЛЕНИЯ
+═══════════════════════════════════════════════
+
+1. НЕЗАКОНЧЕННАЯ МЫСЛЬ
+   Если сегмент не несёт самостоятельного смысла — обрывается на полуслове,
+   начинает мысль но не завершает её — ставь keep=false.
+   Тест: "Если убрать этот сегмент, зритель ничего не потеряет?"
+   Если да — убирай.
+
+2. ФАЛЬСТАРТ / ПОВТОР
+   Если автор запнулся, не договорил, и в следующем сегменте начинает
+   ту же мысль заново (дословно или другими словами) — предыдущий сегмент
+   это неудавшаяся попытка. Удаляй его, оставляй только завершённую версию.
+
+   Признаки фальстарта:
+   - Текущий сегмент обрывается или незакончен
+   - Следующий сегмент начинает похожую/ту же мысль
+   - Повтор не обязательно дословный: одна мысль разными словами тоже повтор
+
+3. ТЕХНИЧЕСКИЕ ПАУЗЫ
+   Сегменты где автор молчит или ждёт (загрузка, рендер, зависание).
+
+4. НЕРЕЛЕВАНТНЫЕ ОТСТУПЛЕНИЯ
+   Разговоры не по теме работы.
+
+═══════════════════════════════════════════════
+ПРАВИЛА СОХРАНЕНИЯ
+═══════════════════════════════════════════════
+- Объяснения что делает автор
 - Ключевые решения и действия
 - Интересные находки и "эврика"-моменты
-- Критику и итерации над работой
+- Критика, итерации, изменение решений
+- Финальный результат и выводы
 
-Верни строго JSON:
+═══════════════════════════════════════════════
+ФОРМАТ ОТВЕТА
+═══════════════════════════════════════════════
+Верни строго JSON без лишнего текста:
 {{"segments": [{{"index": 0, "score": 0.85, "keep": true, "reason": "кратко"}}]}}
 
-score=1.0 — исключительно важный момент, score=0.0 — однозначно вырезать."""
+score=1.0 — ключевой момент, score=0.0 — однозначно вырезать.
+reason — одна фраза, зачем оставляем или почему убираем."""
+
+
+def _build_highlights_prompt(segments: List[Dict], max_sec: float) -> str:
+    max_min = max_sec / 60
+    lines = [
+        f"Это уже отобранные фрагменты из длинной версии видео. "
+        f"Выбери из них лучшие суммарно до {max_min:.0f} минут.\n",
+        "ТРЕБОВАНИЯ к 3-минутной версии:",
+        "- Должна быть самостоятельным роликом с началом, серединой и концом",
+        "- Начало: первый или один из первых сегментов — анонс темы",
+        "- Конец: один из последних сегментов — финальный результат или вывод",
+        "- Середина: самые яркие и интересные моменты процесса",
+        "- НЕ бери 3 минуты из одного места — покрывай весь процесс\n",
+        "Фрагменты:\n",
+    ]
+    for i, seg in enumerate(segments):
+        start = _fmt_time(seg["start"])
+        end   = _fmt_time(seg["end"])
+        text  = seg.get("text", "").strip() or "[тишина]"
+        dur   = seg["end"] - seg["start"]
+        lines.append(f"[{i}] {start}–{end} ({dur:.0f}с)  {text}")
+
+    lines.append(
+        f"\nВерни JSON: "
+        f'{{"segments": [{{"index": 0, "score": 0.0, "keep": false, "reason": "..."}}]}}'
+    )
+    return "\n".join(lines)
 
 
 class LLMAnalyzer:
 
     def analyze(self, segments: List[Dict]) -> List[Dict]:
         """
-        Принимает сегменты от Transcriber, возвращает их же с добавленными полями:
-          - "score":  float 0..1 (важность)
-          - "keep":   bool (оставить или вырезать)
-          - "reason": str (объяснение LLM — для отладки)
-
-        Отправляет ВСЮ транскрипцию одним запросом для понимания полного контекста.
+        Полный анализ транскрипции. Возвращает сегменты с полями score, keep, reason.
+        Отправляет всё одним запросом для понимания полного контекста.
         При слишком большом объёме — разбивает на чанки (fallback).
         """
         if not segments:
@@ -83,21 +135,57 @@ class LLMAnalyzer:
         max_chars = config.LLM_CHUNK_SIZE_TOKENS * 4
 
         if total_chars <= max_chars:
-            # Отправляем всё целиком — LLM видит полный контекст
             log.info(f"LLM анализ: {len(segments)} сегментов одним запросом")
-            result = self._analyze_chunk(segments)
+            result = self._analyze_chunk(segments, _build_system_prompt())
         else:
-            # Fallback: чанкинг для очень длинных видео
             chunks = self._split_into_chunks(segments)
-            log.info(f"LLM анализ: {len(segments)} сегментов, {len(chunks)} чанков (видео длинное)")
+            log.info(f"LLM анализ: {len(segments)} сегментов, {len(chunks)} чанков")
             result = []
             for i, chunk in enumerate(chunks):
                 log.info(f"Анализирую чанк {i+1}/{len(chunks)} ({len(chunk)} сегментов)...")
-                result.extend(self._analyze_chunk(chunk))
+                result.extend(self._analyze_chunk(chunk, _build_system_prompt()))
 
         kept = sum(1 for s in result if s.get("keep"))
         log.info(f"LLM: оставлено {kept}/{len(result)} сегментов")
         return result
+
+    def analyze_highlights(self, segments: List[Dict], max_sec: float) -> List[Dict]:
+        """
+        Второй проход: из уже отобранных сегментов (10-мин таймлайн) выбирает
+        лучшие max_sec секунд для 3-минутной версии.
+
+        Возвращает те же сегменты с обновлёнными keep/score.
+        """
+        if not segments:
+            return []
+
+        log.info(f"LLM хайлайты: выбираю лучшие {max_sec/60:.0f} мин из {len(segments)} сегментов")
+
+        system = (
+            "Ты — опытный видеомонтажёр для YouTube. "
+            "Твоя задача — выбрать лучшие фрагменты для короткой версии ролика. "
+            "Отвечай строго JSON без лишнего текста."
+        )
+        user = _build_highlights_prompt(segments, max_sec)
+
+        last_error = None
+        for attempt in range(config.LLM_MAX_RETRIES):
+            try:
+                raw = self._call_api_with_system(system, user)
+                scored = self._parse_response(raw, len(segments))
+                result = self._apply_scores(segments, scored)
+                kept = sum(1 for s in result if s.get("keep"))
+                kept_dur = sum(s["end"] - s["start"] for s in result if s.get("keep"))
+                log.info(f"LLM хайлайты: {kept} сегментов, {kept_dur:.0f}с")
+                return result
+            except Exception as e:
+                last_error = e
+                wait = 2 ** attempt
+                log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES}: {e}. Жду {wait}с...")
+                time.sleep(wait)
+
+        log.error(f"LLM хайлайты не ответил: {last_error}")
+        return self._apply_scores(segments, [])
 
     # ── Разбивка на чанки (fallback для очень длинных видео) ─────────────────
 
@@ -123,31 +211,26 @@ class LLMAnalyzer:
 
     # ── Анализ одного чанка ───────────────────────────────────────────────────
 
-    def _analyze_chunk(self, chunk: List[Dict]) -> List[Dict]:
-        """
-        Отправляет чанк в OpenRouter, получает оценки, применяет к сегментам.
-        При ошибке — retry с экспоненциальной паузой.
-        """
+    def _analyze_chunk(self, chunk: List[Dict], system_prompt: str) -> List[Dict]:
         user_prompt = self._build_prompt(chunk)
 
         last_error = None
         for attempt in range(config.LLM_MAX_RETRIES):
             try:
-                raw_response = self._call_api(user_prompt)
+                raw_response = self._call_api_with_system(system_prompt, user_prompt)
                 scored = self._parse_response(raw_response, len(chunk))
                 return self._apply_scores(chunk, scored)
 
             except Exception as e:
                 last_error = e
-                wait = 2 ** attempt  # 1с, 2с, 4с
+                wait = 2 ** attempt
                 log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES} не удалась: {e}. Жду {wait}с...")
                 time.sleep(wait)
 
-        # Все попытки исчерпаны — возвращаем сегменты с нейтральными оценками
         log.error(f"LLM не ответил после {config.LLM_MAX_RETRIES} попыток: {last_error}")
         return self._apply_scores(chunk, [])
 
-    def _call_api(self, user_prompt: str) -> str:
+    def _call_api_with_system(self, system: str, user: str) -> str:
         """Делает HTTP запрос к OpenRouter API, возвращает текст ответа."""
         response = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -159,10 +242,10 @@ class LLMAnalyzer:
             json={
                 "model": config.LLM_MODEL,
                 "messages": [
-                    {"role": "system", "content": _build_system_prompt()},
-                    {"role": "user",   "content": user_prompt},
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
                 ],
-                "temperature": 0.2,  # низкая температура = стабильный JSON
+                "temperature": 0.2,
             },
             timeout=120.0,
         )
@@ -173,10 +256,7 @@ class LLMAnalyzer:
     # ── Промпт ────────────────────────────────────────────────────────────────
 
     def _build_prompt(self, segments: List[Dict]) -> str:
-        """
-        Формирует текст запроса к LLM с нумерованными сегментами.
-        """
-        lines = ["Вот сегменты транскрипции. Оцени каждый:\n"]
+        lines = ["Вот полная транскрипция видео. Оцени каждый сегмент:\n"]
         for i, seg in enumerate(segments):
             start = _fmt_time(seg["start"])
             end   = _fmt_time(seg["end"])
@@ -192,10 +272,6 @@ class LLMAnalyzer:
     # ── Парсинг ответа ────────────────────────────────────────────────────────
 
     def _parse_response(self, text: str, expected_count: int) -> List[Dict]:
-        """
-        Парсит JSON из ответа LLM.
-        Пробует прямой json.loads, затем ищет JSON в тексте через regex.
-        """
         # Попытка 1: прямой парсинг
         try:
             data = json.loads(text)
@@ -206,7 +282,7 @@ class LLMAnalyzer:
         except json.JSONDecodeError:
             pass
 
-        # Попытка 2: извлечь JSON-объект из текста (LLM иногда добавляет преамбулу)
+        # Попытка 2: извлечь JSON-объект из текста
         match = re.search(r'\{.*"segments"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
         if match:
             try:
@@ -227,11 +303,6 @@ class LLMAnalyzer:
         return []
 
     def _apply_scores(self, chunk: List[Dict], scored: List[Dict]) -> List[Dict]:
-        """
-        Применяет оценки LLM к сегментам чанка.
-        Если LLM не вернул оценку для сегмента — keep=False, score=0.5.
-        """
-        # Индексируем оценки по полю "index"
         score_map: Dict[int, Dict] = {item["index"]: item for item in scored if "index" in item}
 
         result = []
@@ -242,7 +313,6 @@ class LLMAnalyzer:
             raw_score = float(llm_data.get("score", 0.5))
             raw_keep  = llm_data.get("keep", None)
 
-            # Если LLM не прислал keep — определяем по порогу
             if raw_keep is None:
                 keep = raw_score >= _KEEP_THRESHOLD
             else:
