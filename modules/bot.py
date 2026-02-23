@@ -232,6 +232,10 @@ class AutomontazhBot:
             await progress("📤 Загружаю результаты на Google Drive...")
             await asyncio.to_thread(self._upload_output, session_name)
 
+            # Удаляем входную папку сессии с сервера (файлы уже на Google Drive)
+            if config.ARCHIVE_INPUT_AFTER_PROCESSING:
+                await asyncio.to_thread(self._delete_input, session_name)
+
             await progress(
                 f"✅ <b>Готово!</b>\n\n"
                 f"Сессия: <b>{session_name}</b>\n"
@@ -296,6 +300,14 @@ class AutomontazhBot:
 
         if result.returncode != 0:
             raise RuntimeError(f"rclone завершился с ошибкой:\n{result.stderr[-1000:]}")
+
+    def _delete_input(self, session_name: str) -> None:
+        """Удаляет папку входной сессии с сервера после успешной обработки."""
+        import shutil
+        input_path = config.INPUT_DIR / session_name
+        if input_path.exists():
+            shutil.rmtree(input_path)
+            log.info(f"Удалена входная папка: {input_path}")
 
     def _upload_output(self, session_name: str) -> None:
         """Загружает папку output/session_name/ на Google Drive."""
