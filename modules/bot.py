@@ -3,9 +3,10 @@ bot.py — Telegram-бот для управления системой Авто
 
 Команды:
   /start    — приветствие и список команд
-  /sync     — скачать новые файлы с Яндекс Диска
+  /sync     — скачать новые файлы с Google Drive
   /sessions — показать список сессий, готовых к обработке
   /status   — текущий статус (обрабатывается / свободно)
+  /cancel   — остановить текущую обработку
 
 Безопасность:
   Бот отвечает ТОЛЬКО пользователю с TELEGRAM_ALLOWED_CHAT_ID из config.py.
@@ -16,6 +17,8 @@ bot.py — Telegram-бот для управления системой Авто
 
 import asyncio
 import logging
+import os
+import signal
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
@@ -62,6 +65,7 @@ class AutomontazhBot:
         app.add_handler(CommandHandler("sync",     self._cmd_sync))
         app.add_handler(CommandHandler("sessions", self._cmd_sessions))
         app.add_handler(CommandHandler("status",   self._cmd_status))
+        app.add_handler(CommandHandler("cancel",   self._cmd_cancel))
 
         # Обработчик нажатий на inline-кнопки (выбор сессии)
         app.add_handler(CallbackQueryHandler(self._on_session_selected, pattern="^process:"))
@@ -79,9 +83,10 @@ class AutomontazhBot:
         text = (
             "Привет! Я Автомонтаж — система автоматического монтажа видео.\n\n"
             "Команды:\n"
-            "/sync — скачать новые файлы с Яндекс Диска\n"
+            "/sync — скачать новые файлы с Google Drive\n"
             "/sessions — показать сессии для обработки\n"
-            "/status — статус обработки\n\n"
+            "/status — статус обработки\n"
+            "/cancel — остановить текущую обработку\n\n"
             "Перед первым запуском выполни /sync чтобы скачать файлы."
         )
         await update.message.reply_text(text)
@@ -90,7 +95,7 @@ class AutomontazhBot:
         if not self._is_allowed(update):
             return
 
-        msg = await update.message.reply_text("⏳ Синхронизирую с Яндекс Диском...")
+        msg = await update.message.reply_text("⏳ Синхронизирую с Google Drive...")
 
         try:
             # Считаем сессии до синхронизации
@@ -125,7 +130,7 @@ class AutomontazhBot:
         if not sessions:
             await update.message.reply_text(
                 "Нет сессий для обработки.\n"
-                "Загрузи файлы на Яндекс Диск и выполни /sync"
+                "Загрузи файлы на Google Drive и выполни /sync"
             )
             return
 
@@ -223,15 +228,15 @@ class AutomontazhBot:
         try:
             await asyncio.to_thread(self.pipeline_fn, session, sync_progress)
 
-            # Загружаем результаты на Яндекс Диск
-            await progress("📤 Загружаю результаты на Яндекс Диск...")
+            # Загружаем результаты на Google Drive
+            await progress("📤 Загружаю результаты на Google Drive...")
             await asyncio.to_thread(self._upload_output, session_name)
 
             await progress(
                 f"✅ <b>Готово!</b>\n\n"
                 f"Сессия: <b>{session_name}</b>\n"
-                f"Видео загружены на Яндекс Диск:\n"
-                f"<code>Автомонтаж/output/{session_name}/</code>"
+                f"Видео загружены на Google Drive:\n"
+                f"<code>PROJECTS/Автомонтаж/output/{session_name}/</code>"
             )
         except Exception as e:
             log.error(f"Ошибка при обработке {session_name}: {e}", exc_info=True)
@@ -258,8 +263,24 @@ class AutomontazhBot:
             return False
         return True
 
+    async def _cmd_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_allowed(update):
+            return
+
+        if not self.is_processing:
+            await update.message.reply_text("Ничего не обрабатывается.")
+            return
+
+        await update.message.reply_text(
+            f"⛔ Останавливаю обработку <b>{self.current_session}</b>...\n"
+            "Бот перезапустится через несколько секунд.",
+            parse_mode="HTML"
+        )
+        log.warning("Получена команда /cancel — завершаю процесс.")
+        os.kill(os.getpid(), signal.SIGTERM)
+
     def _run_rclone_sync(self) -> None:
-        """Запускает rclone sync: Яндекс Диск → локальная папка input/."""
+        """Запускает rclone sync: Google Drive → локальная папка input/."""
         remote_path = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_INPUT_PATH}"
         local_path  = str(config.INPUT_DIR)
 
@@ -277,7 +298,7 @@ class AutomontazhBot:
             raise RuntimeError(f"rclone завершился с ошибкой:\n{result.stderr[-1000:]}")
 
     def _upload_output(self, session_name: str) -> None:
-        """Загружает папку output/session_name/ на Яндекс Диск."""
+        """Загружает папку output/session_name/ на Google Drive."""
         local_path  = str(config.OUTPUT_DIR / session_name)
         remote_path = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}/{session_name}"
 
