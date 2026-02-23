@@ -99,6 +99,8 @@ class TimelineBuilder:
         protect_n = max(1, int(n * _PROTECT_FRACTION))
 
         protected_idx = set(range(protect_n)) | set(range(n - protect_n, n))
+        # Интеграции защищены от удаления независимо от позиции в таймлайне
+        protected_idx |= {i for i, s in enumerate(segments) if s.get("integration")}
         middle = [(i, s) for i, s in enumerate(segments) if i not in protected_idx]
 
         # Сортируем кандидатов на удаление по score возрастанию
