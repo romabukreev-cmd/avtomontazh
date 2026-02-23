@@ -14,6 +14,7 @@ transcriber.py — транскрипция аудио и обнаружение
 """
 
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Dict, List
@@ -37,6 +38,9 @@ class Transcriber:
         """
         Главный метод: принимает видеофайл, возвращает список сегментов без пауз.
 
+        Использует FFmpeg silencedetect для точного определения пауз (как в Premiere Pro),
+        Whisper — только для транскрипции текста.
+
         Returns:
             [
                 {"start": 0.0,  "end": 12.4, "text": "Хорошо, попробуем вот так..."},
@@ -46,10 +50,9 @@ class Transcriber:
         """
         audio_file = self._extract_audio(video_file)
         try:
-            words = self._transcribe(audio_file)
-            segments = self._split_by_pauses(words)
+            words    = self._transcribe(audio_file)
+            segments = self._split_by_pauses(words, audio_file)
         finally:
-            # Удаляем WAV после работы — он тяжёлый
             audio_file.unlink(missing_ok=True)
 
         log.info(f"Итого сегментов: {len(segments)}")
@@ -127,62 +130,95 @@ class Transcriber:
         log.info(f"Распознано слов: {len(words)}")
         return words
 
-    # ── Шаг 3: Нарезка по паузам ─────────────────────────────────────────────
+    # ── Шаг 3: Нарезка по паузам (через FFmpeg silencedetect) ───────────────────
 
-    def _split_by_pauses(self, words: List[Dict]) -> List[Dict]:
+    def _split_by_pauses(self, words: List[Dict], audio_file: Path) -> List[Dict]:
         """
-        По списку слов находит паузы и нарезает сегменты.
+        Определяет паузы через FFmpeg silencedetect (точно, как в Premiere Pro),
+        строит речевые сегменты из не-тихих областей,
+        заполняет текстом из Whisper-слов.
+        """
+        silence_regions = self._detect_silence_regions(audio_file)
+        audio_duration  = self._get_audio_duration(audio_file)
 
-        Алгоритм:
-          - Идём по словам
-          - Если разрыв между концом предыдущего слова и началом следующего
-            больше PAUSE_THRESHOLD_SEC — закрываем текущий сегмент
-          - Собираем текст сегмента, фильтруем слишком короткие
-        """
-        if not words:
-            log.warning("Слов не найдено — аудио пустое или тихое")
+        if not silence_regions:
+            # Тишины не найдено — весь аудио одним сегментом
+            text = " ".join(w["word"] for w in words if w["word"]).strip()
+            if audio_duration >= config.MIN_SEGMENT_DURATION_SEC:
+                return [{"start": 0.0, "end": round(audio_duration, 3), "text": text}]
             return []
 
+        # Строим речевые интервалы — всё что НЕ тишина
+        speech_regions = []
+        cursor = 0.0
+        for silence in sorted(silence_regions, key=lambda x: x["start"]):
+            if silence["start"] - cursor >= config.MIN_SEGMENT_DURATION_SEC:
+                speech_regions.append({"start": cursor, "end": silence["start"]})
+            cursor = silence["end"]
+        if audio_duration - cursor >= config.MIN_SEGMENT_DURATION_SEC:
+            speech_regions.append({"start": cursor, "end": audio_duration})
+
+        # Назначаем Whisper-текст каждому речевому интервалу
         segments = []
-        seg_start   = words[0]["start"]
-        seg_words   = [words[0]]
-
-        for prev, curr in zip(words, words[1:]):
-            gap = curr["start"] - prev["end"]
-
-            if gap > config.PAUSE_THRESHOLD_SEC:
-                # Пауза — закрываем сегмент
-                self._close_segment(segments, seg_start, prev["end"], seg_words)
-                seg_start = curr["start"]
-                seg_words = [curr]
-            else:
-                seg_words.append(curr)
-
-        # Закрываем последний сегмент
-        self._close_segment(segments, seg_start, words[-1]["end"], seg_words)
+        for region in speech_regions:
+            region_words = [
+                w for w in words
+                if w["end"] > region["start"] - 0.1 and w["start"] < region["end"] + 0.1
+            ]
+            text = " ".join(w["word"] for w in region_words if w["word"]).strip()
+            segments.append({
+                "start": round(region["start"], 3),
+                "end":   round(region["end"],   3),
+                "text":  text,
+            })
 
         log.info(
             f"Сегментов после нарезки: {len(segments)} "
             f"(порог паузы: {config.PAUSE_THRESHOLD_SEC}с, "
-            f"мин. длина: {config.MIN_SEGMENT_DURATION_SEC}с)"
+            f"уровень шума: {config.SILENCE_NOISE_DB}dB)"
         )
         return segments
 
-    def _close_segment(
-        self,
-        segments: List[Dict],
-        start: float,
-        end: float,
-        words: List[Dict],
-    ) -> None:
-        """Финализирует сегмент и добавляет в список если он достаточно длинный."""
-        duration = end - start
-        if duration < config.MIN_SEGMENT_DURATION_SEC:
-            return
+    def _detect_silence_regions(self, audio_file: Path) -> List[Dict]:
+        """
+        FFmpeg silencedetect: находит все тихие участки в аудио.
+        Возвращает список {start, end} тихих периодов.
+        """
+        cmd = [
+            "ffmpeg", "-i", str(audio_file),
+            "-af", f"silencedetect=noise={config.SILENCE_NOISE_DB}dB:duration={config.PAUSE_THRESHOLD_SEC}",
+            "-f", "null", "-",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
-        text = " ".join(w["word"] for w in words if w["word"]).strip()
-        segments.append({
-            "start": round(start, 3),
-            "end":   round(end, 3),
-            "text":  text,
-        })
+        silence_regions = []
+        current_start   = None
+        for line in result.stderr.split("\n"):
+            s = re.search(r"silence_start: (\d+\.?\d*)", line)
+            e = re.search(r"silence_end: (\d+\.?\d*)",   line)
+            if s:
+                current_start = float(s.group(1))
+            if e and current_start is not None:
+                silence_regions.append({"start": current_start, "end": float(e.group(1))})
+                current_start = None
+
+        # Аудио закончилось в тишине
+        if current_start is not None:
+            silence_regions.append({"start": current_start, "end": float("inf")})
+
+        log.info(f"Найдено пауз: {len(silence_regions)}")
+        return silence_regions
+
+    def _get_audio_duration(self, audio_file: Path) -> float:
+        """ffprobe: длительность аудиофайла в секундах."""
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_file),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            return float(result.stdout.strip())
+        except ValueError:
+            return 0.0

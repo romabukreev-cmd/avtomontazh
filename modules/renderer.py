@@ -80,10 +80,12 @@ class VideoRenderer:
         webcam_list = self._write_concat_list(self.webcam_file, timeline, "webcam")
 
         # Filtergraph: два потока → кроп центра → vstack
-        # Источник 1920×1080, вырезаем 1215×1080 из центра → масштабируем в 1080×960
+        # Экран может быть 1920×1200 — кропаем по Y чтобы получить 1920×1080
+        # Вебка нормализуется до 1920×1080 на случай нестандартного разрешения/SAR
+        cy = config.SCREEN_CROP_Y  # 60 для 1920×1200, 0 для 1920×1080
         filtergraph = (
-            "[0:v]crop=1215:1080:352:0,scale=1080:960[top];"
-            "[1:v]crop=1215:1080:352:0,scale=1080:960[bot];"
+            f"[0:v]crop=1215:1080:352:{cy},scale=1080:960[top];"
+            "[1:v]scale=1920:1080:flags=lanczos,setsar=1,crop=1215:1080:352:0,scale=1080:960[bot];"
             "[top][bot]vstack[out]"
         )
 
@@ -135,16 +137,31 @@ class VideoRenderer:
         #               → скруглённые углы через geq
         #               → [pip]
         #   [bg][pip] → overlay в правый нижний угол
-        r = config.PIP_CORNER_RADIUS
-        s = config.PIP_SIZE          # сторона квадрата
-        # x-offset для центрального кропа из 1920: (1920-1080)/2 = 420
-        crop_offset_x = (1920 - 1080) // 2
+        r  = config.PIP_CORNER_RADIUS
+        s  = config.PIP_SIZE
+        cy = config.SCREEN_CROP_Y        # кроп экрана по вертикали
+        cx = (1920 - 1080) // 2          # = 420, кроп вебки по горизонтали
+
+        # Правильная формула скруглённых углов (CSS border-radius):
+        # Делаем ПРОЗРАЧНЫМИ только угловые зоны за пределами окружности,
+        # всё остальное остаётся видимым.
+        geq_alpha = (
+            f"a='if("
+            f"(lt(X,{r})*lt(Y,{r})*gt(hypot(X-{r},Y-{r}),{r}))+"
+            f"(gt(X,{s}-{r}-1)*lt(Y,{r})*gt(hypot(X-({s}-{r}),Y-{r}),{r}))+"
+            f"(lt(X,{r})*gt(Y,{s}-{r}-1)*gt(hypot(X-{r},Y-({s}-{r})),{r}))+"
+            f"(gt(X,{s}-{r}-1)*gt(Y,{s}-{r}-1)*gt(hypot(X-({s}-{r}),Y-({s}-{r})),{r})),"
+            f"0,255)'"
+        )
+
         filtergraph = (
-            f"[0:v]scale={config.FORMAT_3['width']}:{config.FORMAT_3['height']}[bg];"
-            f"[1:v]crop=1080:1080:{crop_offset_x}:0,scale={s}:{s},format=yuva420p,"
-            f"geq=lum='p(X,Y)':a='if(gt(X,{r})*gt(Y,{r})*lt(X,{s}-{r})*lt(Y,{s}-{r}),255,"
-            f"if(lt(hypot(X-{r},Y-{r}),{r})+lt(hypot(X-{s}+{r},Y-{r}),{r})+"
-            f"lt(hypot(X-{r},Y-{s}+{r}),{r})+lt(hypot(X-{s}+{r},Y-{s}+{r}),{r}),255,0))'[pip];"
+            # Экран: сначала кропаем 1920×1200 → 1920×1080, потом масштабируем
+            f"[0:v]crop={config.FORMAT_3['width']}:1080:0:{cy},"
+            f"scale={config.FORMAT_3['width']}:{config.FORMAT_3['height']}[bg];"
+            # Вебка: нормализуем до 1920×1080, кропаем центральный квадрат 1080×1080
+            f"[1:v]scale=1920:1080:flags=lanczos,setsar=1,"
+            f"crop=1080:1080:{cx}:0,scale={s}:{s},format=yuva420p,"
+            f"geq=lum='p(X,Y)':{geq_alpha}[pip];"
             f"[bg][pip]overlay={pip_x}:{pip_y}[out]"
         )
 
