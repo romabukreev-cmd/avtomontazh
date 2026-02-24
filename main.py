@@ -162,6 +162,7 @@ def process_session(session: Session, progress: Callable) -> None:
     timeline_highlight = builder.build_highlights(
         highlights_scored,
         video_duration=video_duration,
+        max_sec=config.FORMAT_2["max_duration_sec"],
     )
     dur_hl = builder.total_duration(timeline_highlight)
     log.info(f"Хайлайты: {format_duration(dur_hl)}")
@@ -192,22 +193,22 @@ def process_session(session: Session, progress: Callable) -> None:
     # Формат 1 — вертикальный 9:16, 10 минут (social-интеграция)
     renderer.render_vertical(
         timeline_vertical, output_dir,
-        output_filename="vertical_10min.mp4",
-        progress_callback=make_render_progress(1, "верт. 10мин"),
+        output_filename="vertical_9min.mp4",
+        progress_callback=make_render_progress(1, "верт. 9мин"),
     )
 
-    # Формат 2 — вертикальный 9:16, 3 минуты (хайлайты, без интеграции)
+    # Формат 2 — вертикальный 9:16, 2 минуты (хайлайты, без интеграции)
     renderer.render_vertical(
         timeline_highlight, output_dir,
-        output_filename="vertical_3min.mp4",
-        progress_callback=make_render_progress(2, "верт. 3мин"),
+        output_filename="vertical_2min.mp4",
+        progress_callback=make_render_progress(2, "верт. 2мин"),
     )
 
-    # Формат 3 — горизонтальный 16:9, 10 минут (youtube-интеграция)
+    # Формат 3 — горизонтальный 16:9, 9 минут (youtube-интеграция)
     renderer.render_horizontal(
         timeline_horizontal, output_dir,
-        output_filename="horizontal_10min.mp4",
-        progress_callback=make_render_progress(3, "гориз. 10мин"),
+        output_filename="horizontal_9min.mp4",
+        progress_callback=make_render_progress(3, "гориз. 9мин"),
     )
 
     log.info(f"✅ Обработка завершена: {session.name}")

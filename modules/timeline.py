@@ -27,8 +27,8 @@ log = logging.getLogger(__name__)
 _MERGE_GAP_SEC = 0.5
 
 # Padding вокруг каждого отрезка (тишина перед и после речи)
-_PRE_ROLL_SEC  = 0.5
-_POST_ROLL_SEC = 0.5
+_PRE_ROLL_SEC  = 0.3
+_POST_ROLL_SEC = 0.3
 
 # Доля сегментов защищённых от удаления (начало и конец видео)
 _PROTECT_FRACTION = 0.15
@@ -72,10 +72,11 @@ class TimelineBuilder:
         return padded
 
     def build_highlights(self, segments: List[Dict],
-                         video_duration: Optional[float] = None) -> List[Dict]:
+                         video_duration: Optional[float] = None,
+                         max_sec: Optional[float] = None) -> List[Dict]:
         """
         Строит таймлайн из сегментов прошедших второй LLM-проход (analyze_highlights).
-        Просто берём keep=True в хронологическом порядке.
+        Если max_sec задан — обрезает до лимита (как build_long).
         """
         kept = [s for s in segments if s.get("keep", False)]
         if not kept:
@@ -84,7 +85,14 @@ class TimelineBuilder:
 
         kept.sort(key=lambda s: s["start"])
         merged = self._merge_close(kept)
+
+        if max_sec and self.total_duration(merged) > max_sec:
+            merged = self._prune_by_priority(merged, max_sec)
+
         padded = self._add_padding(merged, video_duration)
+
+        if max_sec and self.total_duration(padded) > max_sec:
+            padded = self._prune_by_priority(padded, max_sec)
 
         actual = self.total_duration(padded)
         log.info(f"Хайлайты: {len(padded)} отрезков, {actual:.1f}с")

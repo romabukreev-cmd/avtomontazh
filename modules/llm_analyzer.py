@@ -213,7 +213,7 @@ class LLMAnalyzer:
                 log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES}: {e}. Жду {wait}с...")
                 time.sleep(wait)
 
-        log.error(f"LLM хайлайты не ответил: {last_error}")
+        log.error(f"⚠️ LLM хайлайты не ответил: {last_error}. Проверь OPENROUTER_API_KEY и баланс.")
         return self._apply_scores(segments, [])
 
     # ── Разбивка на чанки (fallback для очень длинных видео) ─────────────────
@@ -256,7 +256,8 @@ class LLMAnalyzer:
                 log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES} не удалась: {e}. Жду {wait}с...")
                 time.sleep(wait)
 
-        log.error(f"LLM не ответил после {config.LLM_MAX_RETRIES} попыток: {last_error}")
+        log.error(f"⚠️ LLM НЕ ОТВЕТИЛ после {config.LLM_MAX_RETRIES} попыток: {last_error}. "
+                  f"Все сегменты будут сохранены (fallback). Проверь OPENROUTER_API_KEY и баланс.")
         return self._apply_scores(chunk, [])
 
     def _call_api_with_system(self, system: str, user: str) -> str:
