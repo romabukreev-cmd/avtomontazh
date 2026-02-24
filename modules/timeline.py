@@ -61,7 +61,13 @@ class TimelineBuilder:
 
         padded = self._add_padding(merged, video_duration)
 
+        # Padding добавляет до 1с на каждый сегмент и может превысить лимит.
+        # Второй проход: убираем наименее важные из середины уже padded-сегментов.
         actual = self.total_duration(padded)
+        if actual > max_sec:
+            padded = self._prune_by_priority(padded, max_sec)
+            actual = self.total_duration(padded)
+
         log.info(f"Длинный таймлайн: {len(padded)} отрезков, {actual:.1f}с")
         return padded
 

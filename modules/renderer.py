@@ -270,38 +270,18 @@ class VideoRenderer:
 
     def _build_audio_fade_filter(self, timeline: List[Dict]) -> str:
         """
-        Строит цепочку afade-фильтров для плавного звука на всех стыках склейки.
+        Строит afade-фильтры: плавный fade-in в начале и fade-out в конце ролика.
 
-        Для каждой точки склейки добавляет:
-          - fade-out 0.5с перед стыком
-          - fade-in  0.5с после стыка
-        Плюс fade-in в начале и fade-out в конце всего ролика.
-
-        Результат: 'afade=t=in:st=0:d=0.5,afade=t=out:st=9.5:d=0.5,...'
+        Примечание: фейды на стыках склейки НЕ применяются, потому что
+        несколько последовательных afade=t=out зануляют аудио навсегда —
+        каждый afade=t=out держит нулевое усиление после своего периода,
+        и последующий afade=t=in не может поднять уже обнулённый сигнал.
+        Concat demuxer обеспечивает точные inpoint/outpoint без артефактов.
         """
         d = 0.5  # длительность fade в секундах
-        fades = []
-
-        # Fade-in в начале
-        fades.append(f"afade=t=in:st=0:d={d}")
-
-        # Вычисляем позиции стыков в выходном потоке
-        t = 0.0
-        for i, seg in enumerate(timeline):
-            dur = seg["end"] - seg["start"]
-            t += dur
-            if i < len(timeline) - 1:
-                # Fade-out перед стыком
-                fade_out_st = max(0.0, t - d)
-                fades.append(f"afade=t=out:st={fade_out_st:.3f}:d={d}")
-                # Fade-in после стыка
-                fades.append(f"afade=t=in:st={t:.3f}:d={d}")
-
-        # Fade-out в конце
-        fade_out_st = max(0.0, t - d)
-        fades.append(f"afade=t=out:st={fade_out_st:.3f}:d={d}")
-
-        return ",".join(fades)
+        total = sum(s["end"] - s["start"] for s in timeline)
+        fade_out_start = max(0.0, total - d)
+        return f"afade=t=in:st=0:d={d},afade=t=out:st={fade_out_start:.3f}:d={d}"
 
     def cleanup_temp(self) -> None:
         """Удаляет все временные файлы, созданные при рендере."""
