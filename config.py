@@ -61,7 +61,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 # Модель для анализа транскрипции
 # Хорошие варианты: "anthropic/claude-3.5-sonnet", "openai/gpt-4o-mini", "google/gemini-flash-1.5"
-LLM_MODEL = "google/gemini-2.0-flash"
+LLM_MODEL = "google/gemini-2.0-flash-001"
 
 # Лимит токенов на один запрос к LLM (только при принудительном чанкинге)
 LLM_CHUNK_SIZE_TOKENS = 80000  # Gemini 2.0 Flash — 1M контекст, большой лимит
