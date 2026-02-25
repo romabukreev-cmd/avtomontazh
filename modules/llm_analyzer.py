@@ -119,10 +119,22 @@ null — обычный контент, не интеграция.
 - Последняя запись → keep=true, score=1.0, "integration": "<тип>"
 
 ═══════════════════════════════════════════════
+ОБЯЗАТЕЛЬНАЯ ФАЗА АНАЛИЗА (выполни ДО оценки сегментов)
+═══════════════════════════════════════════════
+Прочитай ВСЕ сегменты целиком. Перед тем как выставлять оценки,
+запиши в поле "analysis" анализ (3–5 предложений):
+1. На какие смысловые части делится видео и где проходят границы
+2. Какие сегменты — ключевые (нельзя вырезать)
+3. Какие темы/мысли повторяются и в каких сегментах
+4. Что точно стоит убрать и почему
+
+Только после этого анализа — расставляй keep/score для каждого сегмента.
+
+═══════════════════════════════════════════════
 ФОРМАТ ОТВЕТА
 ═══════════════════════════════════════════════
 Верни строго JSON без лишнего текста:
-{{"segments": [{{"index": 0, "score": 0.85, "keep": true, "reason": "кратко", "integration": null}}]}}
+{{"analysis": "...", "segments": [{{"index": 0, "score": 0.85, "keep": true, "reason": "кратко", "integration": null}}]}}
 
 score=1.0 — ключевой момент, score=0.0 — однозначно вырезать.
 reason — одна фраза, зачем оставляем или почему убираем.
@@ -168,8 +180,10 @@ def _build_highlights_prompt(segments: List[Dict], max_sec: float) -> str:
         lines.append(f"[{i}] {start}–{end} ({dur:.0f}с)  {text}")
 
     lines.append(
-        f"\nВерни JSON: "
-        f'{{"segments": [{{"index": 0, "score": 0.0, "keep": false, "reason": "..."}}]}}'
+        f"\nСначала в поле \"analysis\" опиши: какие фрагменты покрывают начало/середину/конец "
+        f"процесса, какие наиболее показательны, какие можно пропустить. Затем выбери сегменты.\n"
+        f"Верни JSON: "
+        f'{{"analysis": "...", "segments": [{{"index": 0, "score": 0.0, "keep": false, "reason": "..."}}]}}'
     )
     return "\n".join(lines)
 
@@ -321,7 +335,7 @@ class LLMAnalyzer:
 
         lines.append(
             "\nВерни JSON: "
-            '{"segments": [{"index": 0, "score": 0.0, "keep": false, "reason": "..."}, ...]}'
+            '{"analysis": "...", "segments": [{"index": 0, "score": 0.0, "keep": false, "reason": "..."}, ...]}'
         )
         return "\n".join(lines)
 
@@ -332,6 +346,8 @@ class LLMAnalyzer:
         try:
             data = json.loads(text)
             if isinstance(data, dict) and "segments" in data:
+                if "analysis" in data:
+                    log.info(f"LLM анализ видео: {data['analysis']}")
                 return data["segments"]
             if isinstance(data, list):
                 return data
@@ -343,6 +359,8 @@ class LLMAnalyzer:
         if match:
             try:
                 data = json.loads(match.group())
+                if "analysis" in data:
+                    log.info(f"LLM анализ видео: {data['analysis']}")
                 return data.get("segments", [])
             except json.JSONDecodeError:
                 pass
