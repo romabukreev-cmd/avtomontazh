@@ -19,7 +19,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List
 
-import whisper
+from faster_whisper import WhisperModel
 
 import config
 
@@ -31,7 +31,11 @@ class Transcriber:
     def __init__(self):
         # Модель загружается один раз при создании объекта
         log.info(f"Загрузка Whisper модели '{config.WHISPER_MODEL}'...")
-        self._model = whisper.load_model(config.WHISPER_MODEL)
+        self._model = WhisperModel(
+            config.WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8",  # int8 квантизация: +30% скорость, качество не страдает
+        )
         log.info("Whisper готов")
 
     def transcribe_and_cut_pauses(self, video_file: Path) -> List[Dict]:
@@ -98,33 +102,33 @@ class Transcriber:
         """
         log.info(f"Транскрипция ({config.WHISPER_MODEL}, язык: {config.WHISPER_LANGUAGE})...")
 
-        result = self._model.transcribe(
+        segments_gen, _info = self._model.transcribe(
             str(audio_file),
             language=config.WHISPER_LANGUAGE,
             word_timestamps=True,
-            verbose=False,
         )
 
         # Извлекаем плоский список слов из всех сегментов Whisper
+        # faster-whisper возвращает генератор объектов (не dict), атрибуты через точку
         words = []
-        for segment in result.get("segments", []):
-            segment_words = segment.get("words", [])
+        for seg in segments_gen:
+            seg_words = seg.words or []
 
-            if segment_words:
+            if seg_words:
                 # Есть пословные таймстемпы — используем их
-                for w in segment_words:
-                    if w.get("start") is not None and w.get("end") is not None:
+                for w in seg_words:
+                    if w.start is not None and w.end is not None:
                         words.append({
-                            "word":  w["word"].strip(),
-                            "start": float(w["start"]),
-                            "end":   float(w["end"]),
+                            "word":  w.word.strip(),
+                            "start": float(w.start),
+                            "end":   float(w.end),
                         })
             else:
                 # Нет пословных таймстемпов — используем весь сегмент как одно слово
                 words.append({
-                    "word":  segment.get("text", "").strip(),
-                    "start": float(segment["start"]),
-                    "end":   float(segment["end"]),
+                    "word":  seg.text.strip(),
+                    "start": float(seg.start),
+                    "end":   float(seg.end),
                 })
 
         log.info(f"Распознано слов: {len(words)}")

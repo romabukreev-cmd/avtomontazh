@@ -120,12 +120,12 @@ PIP_MARGIN_BOTTOM = 60      # отступ от нижнего края
 # Кодек видео: libx264 (CPU, совместимость) или h264_nvenc (GPU NVIDIA, быстро)
 VIDEO_CODEC = "libx264"
 VIDEO_CRF   = 23      # качество: 18 = лучше/тяжелее, 28 = хуже/легче
-VIDEO_PRESET = "fast" # ultrafast/fast/medium/slow
+VIDEO_PRESET = "ultrafast" # ultrafast/fast/medium/slow
 
 AUDIO_CODEC   = "aac"
 AUDIO_BITRATE = "192k"
 
-FFMPEG_THREADS = 4  # сколько потоков CPU отдать FFmpeg
+FFMPEG_THREADS = 0  # 0 = FFmpeg auto (использует все доступные ядра)
 
 # ─── Логирование и поведение ──────────────────────────────────────────────────
 

@@ -1,5 +1,5 @@
 # Транскрипция речи
-openai-whisper
+faster-whisper
 
 # Telegram-бот
 python-telegram-bot>=20.0
