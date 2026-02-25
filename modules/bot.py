@@ -5,8 +5,9 @@ bot.py — Telegram-бот для управления системой Авто
   /start    — приветствие и список команд
   /sync     — скачать новые файлы с Google Drive
   /sessions — показать список сессий, готовых к обработке
-  /status   — текущий статус (обрабатывается / свободно)
-  /cancel   — остановить текущую обработку
+  /status   — текущий статус (обрабатывается / свободно / очередь)
+  /cancel   — остановить текущую обработку и очистить очередь
+  /reset    — сбросить незавершённую сессию (удалить частичный output)
 
 Безопасность:
   Бот отвечает ТОЛЬКО пользователю с TELEGRAM_ALLOWED_CHAT_ID из config.py.
@@ -21,7 +22,7 @@ import os
 import signal
 import subprocess
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -47,8 +48,10 @@ class AutomontazhBot:
         """
         self.pipeline_fn     = pipeline_fn
         self.session_manager = SessionManager()
-        self.is_processing   = False        # флаг: идёт ли сейчас обработка
+        self.is_processing   = False
         self.current_session: Optional[str] = None
+        self._queue: List[Session] = []   # очередь сессий для автоматической обработки
+        self._app = None                   # ссылка на Application (нужна для отправки сообщений из очереди)
 
     # ── Запуск бота ───────────────────────────────────────────────────────────
 
@@ -59,6 +62,7 @@ class AutomontazhBot:
             .token(config.TELEGRAM_BOT_TOKEN)
             .build()
         )
+        self._app = app  # сохраняем для отправки сообщений из очереди
 
         # Регистрируем обработчики команд
         app.add_handler(CommandHandler("start",    self._cmd_start))
@@ -73,7 +77,6 @@ class AutomontazhBot:
         app.add_handler(CallbackQueryHandler(self._on_reset_selected,   pattern="^reset:"))
 
         log.info("Telegram-бот запущен. Жду команды...")
-        # run_polling() сам управляет event loop — не оборачивать в asyncio.run()
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
     # ── Команды ───────────────────────────────────────────────────────────────
@@ -86,10 +89,11 @@ class AutomontazhBot:
             "Привет! Я Автомонтаж — система автоматического монтажа видео.\n\n"
             "Команды:\n"
             "/sync — скачать новые файлы с Google Drive\n"
-            "/sessions — показать сессии для обработки\n"
-            "/status — статус обработки\n"
-            "/cancel — остановить текущую обработку\n"
+            "/sessions — показать сессии для обработки (можно добавить в очередь)\n"
+            "/status — статус обработки и очередь\n"
+            "/cancel — остановить текущую обработку и очистить очередь\n"
             "/reset — сбросить незавершённую сессию (удалить частичный output)\n\n"
+            "Очередь: выбирай несколько сессий через /sessions — они обработаются автоматически по очереди.\n\n"
             "Перед первым запуском выполни /sync чтобы скачать файлы."
         )
         await update.message.reply_text(text)
@@ -101,13 +105,8 @@ class AutomontazhBot:
         msg = await update.message.reply_text("⏳ Синхронизирую с Google Drive...")
 
         try:
-            # Считаем сессии до синхронизации
             before = {s.name for s in self.session_manager.scan_sessions()}
-
-            # Запускаем rclone sync
             await asyncio.to_thread(self._run_rclone_sync)
-
-            # Считаем сессии после
             after_sessions = self.session_manager.scan_sessions()
             after  = {s.name for s in after_sessions}
             new    = after - before
@@ -137,24 +136,33 @@ class AutomontazhBot:
             )
             return
 
-        if self.is_processing:
-            await update.message.reply_text(
-                f"⏳ Сейчас обрабатывается: <b>{self.current_session}</b>\n"
-                "Дождись завершения перед запуском новой сессии.",
-                parse_mode="HTML"
-            )
-            return
+        queued_names = {s.name for s in self._queue}
 
-        # Формируем inline-клавиатуру с кнопками сессий
+        if self.is_processing:
+            status_line = f"⏳ Сейчас: <b>{self.current_session}</b>\n"
+        else:
+            status_line = ""
+
+        if self._queue:
+            queue_line = "Очередь: " + " → ".join(s.name for s in self._queue) + "\n"
+        else:
+            queue_line = ""
+
         keyboard = []
         for s in sessions:
-            label = f"{s.name}  ({s.file_count} файл{'а' if s.file_count in (2,3,4) else 'ов'})"
+            if s.name == self.current_session:
+                label = f"⏳ {s.name} (обрабатывается)"
+            elif s.name in queued_names:
+                pos = next(i + 1 for i, q in enumerate(self._queue) if q.name == s.name)
+                label = f"#{pos} в очереди: {s.name}"
+            else:
+                label = f"{s.name}  ({s.file_count} файл{'а' if s.file_count in (2, 3, 4) else 'ов'})"
             keyboard.append([InlineKeyboardButton(label, callback_data=f"process:{s.name}")])
 
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            f"Доступно сессий: {len(sessions)}\nВыбери сессию для обработки:",
-            reply_markup=reply_markup
+            f"{status_line}{queue_line}Выбери сессию — начнётся сразу или встанет в очередь:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
         )
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -162,14 +170,22 @@ class AutomontazhBot:
             return
 
         if self.is_processing:
+            if self._queue:
+                queue_line = "\n\n⏳ Очередь: " + " → ".join(s.name for s in self._queue)
+            else:
+                queue_line = ""
             await update.message.reply_text(
-                f"⏳ Обрабатывается: <b>{self.current_session}</b>",
+                f"⏳ Обрабатывается: <b>{self.current_session}</b>{queue_line}",
                 parse_mode="HTML"
             )
         else:
             sessions = self.session_manager.scan_sessions()
+            if self._queue:
+                queue_line = "\n⏳ В очереди: " + " → ".join(s.name for s in self._queue)
+            else:
+                queue_line = ""
             await update.message.reply_text(
-                f"✅ Свободно. Ожидает обработки: {len(sessions)} сессий."
+                f"✅ Свободно. Ожидает обработки: {len(sessions)} сессий.{queue_line}"
             )
 
     # ── Callback: выбор сессии ────────────────────────────────────────────────
@@ -182,17 +198,17 @@ class AutomontazhBot:
         if not self._is_allowed(update):
             return
 
-        if self.is_processing:
+        session_name = query.data.replace("process:", "")
+
+        # Проверяем что не уже в очереди
+        if any(s.name == session_name for s in self._queue):
+            pos = next(i + 1 for i, s in enumerate(self._queue) if s.name == session_name)
             await query.edit_message_text(
-                f"⏳ Уже обрабатывается: <b>{self.current_session}</b>\n"
-                "Дождись завершения.",
+                f"⚠️ <b>{session_name}</b> уже в очереди (позиция {pos}).",
                 parse_mode="HTML"
             )
             return
 
-        session_name = query.data.replace("process:", "")
-
-        # Находим сессию по имени
         sessions = self.session_manager.scan_sessions()
         session  = next((s for s in sessions if s.name == session_name), None)
 
@@ -200,25 +216,45 @@ class AutomontazhBot:
             await query.edit_message_text(f"❌ Сессия '{session_name}' не найдена или уже обработана.")
             return
 
-        # Запускаем обработку в фоне (чтобы не блокировать бота)
-        self.is_processing   = True
-        self.current_session = session_name
+        if self.is_processing:
+            # Добавляем в очередь
+            self._queue.append(session)
+            pos = len(self._queue)
+            queue_names = " → ".join(s.name for s in self._queue)
+            await query.edit_message_text(
+                f"✅ <b>{session_name}</b> добавлена в очередь (позиция {pos}).\n\n"
+                f"Текущая очередь: {queue_names}\n\n"
+                f"Начнётся автоматически после завершения <b>{self.current_session}</b>.",
+                parse_mode="HTML"
+            )
+            return
 
+        # Начинаем обработку немедленно
         status_msg = await query.edit_message_text(
             f"▶ Начинаю обработку: <b>{session_name}</b>\n"
             f"Файлов: {session.file_count} экран + {session.file_count} вебка",
             parse_mode="HTML"
         )
+        asyncio.create_task(self._run_pipeline(session, status_msg))
+
+    # ── Основной пайплайн (запускается как asyncio task) ──────────────────────
+
+    async def _run_pipeline(self, session: Session, status_msg) -> None:
+        """
+        Запускает пайплайн обработки для одной сессии.
+        После завершения автоматически запускает следующую сессию из очереди.
+        """
+        session_name = session.name
+        self.is_processing   = True
+        self.current_session = session_name
+
+        loop = asyncio.get_running_loop()
 
         async def progress(text: str) -> None:
-            """Обновляет сообщение статуса в боте."""
             try:
                 await status_msg.edit_text(text, parse_mode="HTML")
             except Exception:
-                pass  # сообщение могло не измениться (Telegram возвращает ошибку)
-
-        # Синхронная обёртка для передачи в поток (пайплайн синхронный, бот — async)
-        loop = asyncio.get_running_loop()
+                pass
 
         def sync_progress(text: str) -> None:
             future = asyncio.run_coroutine_threadsafe(progress(text), loop)
@@ -227,24 +263,24 @@ class AutomontazhBot:
             except Exception:
                 pass
 
-        # Запускаем тяжёлый пайплайн в отдельном потоке (не блокируем event loop)
         try:
             await asyncio.to_thread(self.pipeline_fn, session, sync_progress)
 
-            # Загружаем результаты на Google Drive
             await progress("📤 Загружаю результаты на Google Drive...")
             await asyncio.to_thread(self._upload_output, session_name)
 
-            # Удаляем входную папку сессии с сервера (файлы уже на Google Drive)
             if config.ARCHIVE_INPUT_AFTER_PROCESSING:
                 await asyncio.to_thread(self._delete_input, session_name)
 
+            queue_info = f"\n\n⏳ Следующая в очереди: <b>{self._queue[0].name}</b>" if self._queue else ""
             await progress(
                 f"✅ <b>Готово!</b>\n\n"
                 f"Сессия: <b>{session_name}</b>\n"
                 f"Видео загружены на Google Drive:\n"
                 f"<code>PROJECTS/Автомонтаж/output/{session_name}/</code>"
+                f"{queue_info}"
             )
+
         except Exception as e:
             log.error(f"Ошибка при обработке {session_name}: {e}", exc_info=True)
             await progress(
@@ -252,19 +288,26 @@ class AutomontazhBot:
                 f"<code>{str(e)[:500]}</code>\n\n"
                 "Подробности в логах на сервере."
             )
+
         finally:
             self.is_processing   = False
             self.current_session = None
 
+            # Запускаем следующую сессию из очереди
+            if self._queue:
+                next_session = self._queue.pop(0)
+                log.info(f"Очередь: запускаю следующую сессию — {next_session.name}")
+                next_msg = await self._app.bot.send_message(
+                    chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
+                    text=f"▶ Начинаю обработку из очереди: <b>{next_session.name}</b>",
+                    parse_mode="HTML"
+                )
+                asyncio.create_task(self._run_pipeline(next_session, next_msg))
+
     # ── Вспомогательные методы ────────────────────────────────────────────────
 
     def _is_allowed(self, update: Update) -> bool:
-        """Проверяет что сообщение от разрешённого пользователя."""
-        chat_id = (
-            update.effective_chat.id
-            if update.effective_chat
-            else None
-        )
+        chat_id = update.effective_chat.id if update.effective_chat else None
         if chat_id != config.TELEGRAM_ALLOWED_CHAT_ID:
             log.warning(f"Отклонён запрос от неизвестного chat_id: {chat_id}")
             return False
@@ -278,14 +321,17 @@ class AutomontazhBot:
             await update.message.reply_text("Ничего не обрабатывается.")
             return
 
-        session_name = self.current_session
+        session_name  = self.current_session
+        queue_cleared = len(self._queue)
+        self._queue.clear()
+
+        queue_msg = f"\nОчередь очищена ({queue_cleared} сессий)." if queue_cleared else ""
         await update.message.reply_text(
             f"⛔ Останавливаю обработку <b>{session_name}</b>...\n"
-            "Бот перезапустится через несколько секунд.",
+            f"Бот перезапустится через несколько секунд.{queue_msg}",
             parse_mode="HTML"
         )
 
-        # Удаляем частичный output чтобы сессия не считалась обработанной
         if session_name:
             import shutil
             output_path = config.OUTPUT_DIR / session_name
@@ -297,7 +343,6 @@ class AutomontazhBot:
         os.kill(os.getpid(), signal.SIGTERM)
 
     async def _cmd_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показывает сессии с незавершённым output для сброса."""
         if not self._is_allowed(update):
             return
 
@@ -313,9 +358,7 @@ class AutomontazhBot:
             await update.message.reply_text("Нет незавершённых сессий.")
             return
 
-        sessions_with_output = sorted(
-            d for d in config.OUTPUT_DIR.iterdir() if d.is_dir()
-        )
+        sessions_with_output = sorted(d for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
 
         if not sessions_with_output:
             await update.message.reply_text("Нет незавершённых сессий.")
@@ -332,7 +375,6 @@ class AutomontazhBot:
         )
 
     async def _on_reset_selected(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Удаляет output-папку выбранной сессии."""
         query = update.callback_query
         await query.answer()
         if not self._is_allowed(update):
@@ -354,25 +396,20 @@ class AutomontazhBot:
             await query.edit_message_text(f"Папка <b>{session_name}</b> не найдена.", parse_mode="HTML")
 
     def _run_rclone_sync(self) -> None:
-        """Запускает rclone sync: Google Drive → локальная папка input/."""
         remote_path = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_INPUT_PATH}"
         local_path  = str(config.INPUT_DIR)
-
         cmd = [
             "rclone", "sync",
             remote_path, local_path,
-            "--min-age", "30s",          # не копировать файлы изменявшиеся последние 30с
+            "--min-age", "30s",
             "--progress",
         ]
-
         log.info(f"rclone sync: {remote_path} → {local_path}")
         result = subprocess.run(cmd, capture_output=True, text=True)
-
         if result.returncode != 0:
             raise RuntimeError(f"rclone завершился с ошибкой:\n{result.stderr[-1000:]}")
 
     def _delete_input(self, session_name: str) -> None:
-        """Удаляет папку входной сессии с сервера после успешной обработки."""
         import shutil
         input_path = config.INPUT_DIR / session_name
         if input_path.exists():
@@ -380,14 +417,10 @@ class AutomontazhBot:
             log.info(f"Удалена входная папка: {input_path}")
 
     def _upload_output(self, session_name: str) -> None:
-        """Загружает папку output/session_name/ на Google Drive."""
         local_path  = str(config.OUTPUT_DIR / session_name)
         remote_path = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}/{session_name}"
-
         cmd = ["rclone", "copy", local_path, remote_path, "--progress"]
-
         log.info(f"rclone upload: {local_path} → {remote_path}")
         result = subprocess.run(cmd, capture_output=True, text=True)
-
         if result.returncode != 0:
             raise RuntimeError(f"rclone upload завершился с ошибкой:\n{result.stderr[-1000:]}")

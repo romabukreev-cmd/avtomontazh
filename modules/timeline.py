@@ -27,8 +27,8 @@ log = logging.getLogger(__name__)
 _MERGE_GAP_SEC = 0.5
 
 # Padding вокруг каждого отрезка (тишина перед и после речи)
-_PRE_ROLL_SEC  = 0.3
-_POST_ROLL_SEC = 0.3
+_PRE_ROLL_SEC  = 0.5
+_POST_ROLL_SEC = 0.5
 
 # Доля сегментов защищённых от удаления (начало и конец видео)
 _PROTECT_FRACTION = 0.15
