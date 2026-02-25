@@ -273,12 +273,16 @@ class AutomontazhBot:
                 await asyncio.to_thread(self._delete_input, session_name)
 
             queue_info = f"\n\n⏳ Следующая в очереди: <b>{self._queue[0].name}</b>" if self._queue else ""
-            await progress(
-                f"✅ <b>Готово!</b>\n\n"
-                f"Сессия: <b>{session_name}</b>\n"
-                f"Видео загружены на Google Drive:\n"
-                f"<code>PROJECTS/Автомонтаж/output/{session_name}/</code>"
-                f"{queue_info}"
+            await self._app.bot.send_message(
+                chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
+                text=(
+                    f"✅ <b>Готово!</b>\n\n"
+                    f"Сессия: <b>{session_name}</b>\n"
+                    f"Видео загружены на Google Drive:\n"
+                    f"<code>PROJECTS/Автомонтаж/output/{session_name}/</code>"
+                    f"{queue_info}"
+                ),
+                parse_mode="HTML",
             )
 
         except Exception as e:
