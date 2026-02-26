@@ -266,22 +266,22 @@ class AutomontazhBot:
         try:
             await asyncio.to_thread(self.pipeline_fn, session, sync_progress)
 
-            await progress("📤 Загружаю результаты на Google Drive...")
+            # Отправляем отдельное сообщение о загрузке — саммари в status_msg не трогаем
+            upload_msg = await self._app.bot.send_message(
+                chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
+                text="📤 Загружаю результаты на Google Drive...",
+                parse_mode="HTML",
+            )
             await asyncio.to_thread(self._upload_output, session_name)
 
             if config.DELETE_INPUT_AFTER_PROCESSING:
                 await asyncio.to_thread(self._delete_input, session_name)
 
             queue_info = f"\n\n⏳ Следующая в очереди: <b>{self._queue[0].name}</b>" if self._queue else ""
-            await self._app.bot.send_message(
-                chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
-                text=(
-                    f"✅ <b>Готово!</b>\n\n"
-                    f"Сессия: <b>{session_name}</b>\n"
-                    f"Видео загружены на Google Drive:\n"
-                    f"<code>PROJECTS/Автомонтаж/output/{session_name}/</code>"
-                    f"{queue_info}"
-                ),
+            await upload_msg.edit_text(
+                f"✅ <b>Готово!</b> Видео загружены на Google Drive:\n"
+                f"<code>PROJECTS/Автомонтаж/output/{session_name}/</code>"
+                f"{queue_info}",
                 parse_mode="HTML",
             )
 

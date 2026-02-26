@@ -210,6 +210,16 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
         progress_callback=make_render_progress(3, "гориз. 9мин"),
     )
 
+    # Итоговый саммари — остаётся предпоследним сообщением (перед уведомлением о загрузке)
+    progress(
+        f"✅ <b>{session.name}</b>\n\n"
+        f"✅ Файлы готовы\n"
+        f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
+        f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
+        f"✅ Таймлайн: {format_duration(dur_vert)} (верт.) / хайлайты {format_duration(dur_hl)}\n"
+        f"✅ Рендер ×3 завершён"
+    )
+
     log.info(f"✅ Обработка завершена: {session.name}")
 
     # ── Шаг 5: Уборка временных файлов ───────────────────────────────────────
