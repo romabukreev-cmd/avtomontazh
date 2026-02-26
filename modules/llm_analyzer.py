@@ -151,9 +151,14 @@ reason — одна фраза, зачем оставляем или почем�
 integration — "youtube", "social", или null.
 
 ФИНАЛЬНАЯ ПРОВЕРКА перед ответом:
-Пройдись по всем сегментам которые ты пометил keep=true.
-Найди пары где два сегмента говорят об одном и том же (пусть разными словами).
-Для каждой такой пары — оставь только более полный/чёткий, второй поставь keep=false."""
+1. Пройдись по всем сегментам с keep=true.
+   Найди пары где два сегмента говорят об одном и том же (пусть разными словами).
+   Для каждой такой пары — оставь только более полный/чёткий, второй поставь keep=false.
+
+2. Подсчитай количество keep=true.
+   Если keep=true у БОЛЕЕ 60% сегментов — ты слишком мягкий.
+   Цель: keep=true у 40–60% сегментов.
+   Вернись к ПРАВИЛАМ УДАЛЕНИЯ и найди ещё повторы и незаконченные мысли."""
 
 
 def _build_highlights_prompt(segments: List[Dict], max_sec: float) -> str:
@@ -356,6 +361,10 @@ class LLMAnalyzer:
     # ── Парсинг ответа ────────────────────────────────────────────────────────
 
     def _parse_response(self, text: str, expected_count: int) -> List[Dict]:
+        # Снимаем markdown-обёртку (```json ... ```)
+        text = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.IGNORECASE)
+        text = re.sub(r'\s*```\s*$', '', text)
+
         # Попытка 1: прямой парсинг
         try:
             data = json.loads(text)
@@ -368,8 +377,8 @@ class LLMAnalyzer:
         except json.JSONDecodeError:
             pass
 
-        # Попытка 2: извлечь JSON-объект из текста
-        match = re.search(r'\{.*"segments"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
+        # Попытка 2: извлечь JSON-объект из текста (жадный поиск — берём наибольший объект)
+        match = re.search(r'\{.*"segments"\s*:\s*\[.*\]\s*\}', text, re.DOTALL)
         if match:
             try:
                 data = json.loads(match.group())
@@ -379,11 +388,13 @@ class LLMAnalyzer:
             except json.JSONDecodeError:
                 pass
 
-        # Попытка 3: найти JSON-массив
-        match = re.search(r'\[.*?\]', text, re.DOTALL)
+        # Попытка 3: найти JSON-массив объектов (жадный; проверяем что элементы — dict, не int)
+        match = re.search(r'\[.*\]', text, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group())
+                result = json.loads(match.group())
+                if isinstance(result, list) and all(isinstance(item, dict) for item in result):
+                    return result
             except json.JSONDecodeError:
                 pass
 
@@ -391,7 +402,11 @@ class LLMAnalyzer:
         return []
 
     def _apply_scores(self, chunk: List[Dict], scored: List[Dict]) -> List[Dict]:
-        score_map: Dict[int, Dict] = {item["index"]: item for item in scored if "index" in item}
+        score_map: Dict[int, Dict] = {
+            item["index"]: item
+            for item in scored
+            if isinstance(item, dict) and "index" in item
+        }
 
         result = []
         for i, seg in enumerate(chunk):
