@@ -11,6 +11,7 @@ main.py — точка входа системы Автомонтаж.
 """
 
 import logging
+import subprocess
 import sys
 from typing import Callable
 
@@ -29,13 +30,13 @@ from modules.utils           import setup_logging, ensure_dirs, format_duration
 #  Вызывается ботом для каждой выбранной пользователем сессии
 # ══════════════════════════════════════════════════════════════════════════════
 
-def process_session(session: Session, progress: Callable) -> None:
+def process_session(session: Session, progress: Callable, transcriber: Transcriber) -> None:
     """
     Полный цикл обработки одной сессии.
     Принимает Session с набором файлов — создаёт три готовых видео.
 
-    progress — синхронная функция для отправки сообщений в Telegram.
-    Thread-safe обёртка создаётся в bot.py перед запуском потока.
+    transcriber — переиспользуется между сессиями (модель загружается один раз в main).
+    progress    — синхронная функция для отправки сообщений в Telegram.
     """
     log = logging.getLogger(f"session.{session.name}")
     log.info(f"▶  Начало обработки: {session.name} ({session.file_count} файлов)")
@@ -63,7 +64,6 @@ def process_session(session: Session, progress: Callable) -> None:
         "⏳ Транскрибирую аудио через Whisper...\n"
         "<i>(это может занять несколько минут)</i>"
     )
-    transcriber = Transcriber()
     speech_segments = transcriber.transcribe_and_cut_pauses(screen_file)
     total_speech = sum(s["end"] - s["start"] for s in speech_segments)
     log.info(f"Транскрипция: {len(speech_segments)} сегментов, {format_duration(total_speech)} речи")
@@ -101,8 +101,7 @@ def process_session(session: Session, progress: Callable) -> None:
     )
 
     # Длительность исходного видео (для корректного padding в timeline builder)
-    import subprocess as _sp
-    _probe = _sp.run(
+    _probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(screen_file)],
         capture_output=True, text=True,
@@ -128,7 +127,7 @@ def process_session(session: Session, progress: Callable) -> None:
     )
     timeline_horizontal = builder.build_long(
         kept_horizontal,
-        max_sec=config.FORMAT_1["max_duration_sec"],
+        max_sec=config.FORMAT_3["max_duration_sec"],
         video_duration=video_duration,
     )
     dur_vert  = builder.total_duration(timeline_vertical)
@@ -253,7 +252,13 @@ def main() -> None:
     log.info(f"  Выходные файлы: {config.OUTPUT_DIR}")
     log.info("═" * 55)
 
-    bot = AutomontazhBot(pipeline_fn=process_session)
+    # Загружаем модель Whisper один раз — переиспользуется для всех сессий
+    transcriber = Transcriber()
+
+    def _pipeline(session: Session, progress: Callable) -> None:
+        process_session(session, progress, transcriber=transcriber)
+
+    bot = AutomontazhBot(pipeline_fn=_pipeline)
     bot.run()  # run_polling() управляет event loop сам
 
 

@@ -29,19 +29,10 @@ renderer.py — сборка финальных видео через FFmpeg.
 
 ─── Формат 3 (горизонтальный PiP 1920×1080) ─────────────────────────────────
 
-  [screen]  → scale 1920×1080 (уже нужного размера) → [bg]
-  [webcam]  → scale до 340×255 → округлые углы (маска через geq) → [pip]
-  [bg][pip] → overlay x=1920-340-30 y=1080-260-30 → [out]
-
-  FFmpeg filtergraph:
-    [0:v]scale=1920:1080[bg];
-    [1:v]scale=340:255,
-         geq='if(gt(hypot(X-W/2,Y-H/2),min(W,H)/2),0,p(X,Y))':
-              'if(gt(hypot(X-W/2,Y-H/2),min(W,H)/2),0,p(X,Y)):...'[pip];
-    [bg][pip]overlay=x=1550:y=790[out]
-
-  Примечание: скруглённые углы реализуются через PNG-маску или корнер-радиус.
-  Точный метод будет выбран при реализации (geq или alphaextract).
+  [screen]  → crop 1920×1200→1920×1080 → scale 1920×1080 → [bg]
+  [webcam]  → scale 1920×1080 → crop квадрат 1080×1080 → scale PIP×PIP
+            → скруглённые углы через geq (yuva420p alpha-маска) → [pip]
+  [bg][pip] → overlay правый нижний угол → [out]
 """
 
 import logging
@@ -136,12 +127,12 @@ class VideoRenderer:
         # Filtergraph:
         #   [0:v] экран → scale 1920×1080 → [bg]
         #   [1:v] вебка → crop квадрат из центра (1080×1080 из 1920×1080)
-        #               → scale до PIP_SIZE×PIP_SIZE
+        #               → scale до PIP_WIDTH×PIP_HEIGHT
         #               → скруглённые углы через geq
         #               → [pip]
         #   [bg][pip] → overlay в правый нижний угол
         r  = config.PIP_CORNER_RADIUS
-        s  = config.PIP_SIZE
+        s  = config.PIP_WIDTH
         cy = config.SCREEN_CROP_Y        # кроп экрана по вертикали
         cx = (1920 - 1080) // 2          # = 420, кроп вебки по горизонтали
 

@@ -269,7 +269,7 @@ class AutomontazhBot:
             await progress("📤 Загружаю результаты на Google Drive...")
             await asyncio.to_thread(self._upload_output, session_name)
 
-            if config.ARCHIVE_INPUT_AFTER_PROCESSING:
+            if config.DELETE_INPUT_AFTER_PROCESSING:
                 await asyncio.to_thread(self._delete_input, session_name)
 
             queue_info = f"\n\n⏳ Следующая в очереди: <b>{self._queue[0].name}</b>" if self._queue else ""
