@@ -170,8 +170,18 @@ class Transcriber:
                 if w["end"] > region["start"] - 0.1 and w["start"] < region["end"] + 0.1
             ]
             text = " ".join(w["word"] for w in region_words if w["word"]).strip()
+
+            # Начинаем сегмент с первого слова Whisper (минус небольшой зазор),
+            # а не с момента когда FFmpeg засёк первый звук.
+            # Это убирает вдохи/дыхание в начале каждого сегмента.
+            if region_words:
+                first_word_start = region_words[0]["start"]
+                seg_start = max(region["start"], first_word_start - config.SEGMENT_START_PADDING_SEC)
+            else:
+                seg_start = region["start"]
+
             segments.append({
-                "start": round(region["start"], 3),
+                "start": round(seg_start,       3),
                 "end":   round(region["end"],   3),
                 "text":  text,
             })
