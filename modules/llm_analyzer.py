@@ -1,14 +1,20 @@
 """
 llm_analyzer.py — анализ транскрипции через LLM (OpenRouter API).
 
-Два прохода:
-  1. analyze(segments) — полный анализ всей транскрипции:
-       - оценивает важность каждого сегмента (score 0..1)
-       - удаляет незаконченные мысли и фальстарты
-       - результат используется для 10-минутных версий
-  2. analyze_highlights(segments, max_sec) — второй проход для 3-минутной версии:
-       - принимает уже отфильтрованные сегменты из 10-мин таймлайна
-       - просит LLM выбрать лучшие max_sec секунд как самостоятельный ролик
+Три прохода:
+  1. _detect_repeats(segments) — находит и помечает повторы и незаконченные мысли.
+       Анализирует все сегменты ЦЕЛИКОМ без чанков — повторы нельзя обнаружить
+       если разбить текст на части.
+
+  2. _score_importance(segments, max_sec) — оценивает важность очищенных сегментов.
+       Предполагает что повторов уже нет, поэтому фокусируется только на важности.
+       Обнаруживает интеграции (youtube/social) и применяет лимит длительности.
+
+  3. analyze_highlights(segments, max_sec) — второй проход для 3-минутной версии.
+       Принимает уже отфильтрованные сегменты из 10-мин таймлайна,
+       просит LLM выбрать лучшие max_sec секунд как самостоятельный ролик.
+
+  analyze() оркестрирует проходы 1+2 и возвращает единый результат.
 """
 
 import json
@@ -26,34 +32,12 @@ log = logging.getLogger(__name__)
 _KEEP_THRESHOLD = 0.5
 
 
-def _build_system_prompt(total_duration: float, max_sec: float) -> str:
-    total_min = total_duration / 60
-    max_min   = max_sec / 60
-    return f"""Ты — редактор видео-транскрипций. Тебе дана ПОЛНАЯ транскрипция видео с таймкодами.
+# ── Промпты ───────────────────────────────────────────────────────────────────
 
-КОНТЕКСТ ВИДЕО:
-{config.VIDEO_CONTEXT}
+def _build_repeats_system_prompt() -> str:
+    return """Ты — редактор видео-транскрипций. Твоя ЕДИНСТВЕННАЯ задача — найти все места где автор повторяет одну и ту же мысль несколько раз подряд, и пометить их для удаления.
 
-Исходный хронометраж: ~{total_min:.0f} мин
-Лимит итогового видео: {max_min:.0f} мин ({max_sec:.0f}с) — но только если нужно (см. ниже)
-
-Паузы (тишина) уже вырезаны до тебя. Ты работаешь только с речевыми сегментами.
-Анализируй весь текст ЦЕЛИКОМ, не блоками — повторы часто стоят на стыке нескольких сегментов подряд.
-
-═══════════════════════════════════════════════
-ПАУЗЫ МЕЖДУ СЕГМЕНТАМИ
-═══════════════════════════════════════════════
-Между сегментами указана длина молчания (═══ пауза Xс ═══).
-- Длинная пауза (≥ 10с) — граница между частями процесса.
-- Короткая пауза (< 5с) — нормальный ритм речи. Повторы происходят именно здесь.
-
-═══════════════════════════════════════════════
-ПРИОРИТЕТ 1 — ОБЯЗАТЕЛЬНЫЙ (выполни всегда, независимо от хронометража)
-═══════════════════════════════════════════════
-УБЕРИ ВСЕ ПОВТОРЫ И НЕЗАКОНЧЕННЫЕ МЫСЛИ.
-
-Это главная задача. Даже если после этого останется {max_min:.0f} мин вместо {total_min:.0f} —
-это правильный результат. Чистое короткое видео лучше длинного с повторами.
+Анализируй весь текст ЦЕЛИКОМ — повторы часто стоят на стыке нескольких сегментов подряд.
 
 ЧТО СЧИТАЕТСЯ ПОВТОРОМ:
 Автор говорит одну и ту же мысль разными словами несколько раз подряд.
@@ -76,16 +60,45 @@ def _build_system_prompt(total_duration: float, max_sec: float) -> str:
 НЕЗАКОНЧЕННЫЕ МЫСЛИ:
 Сегмент обрывается на полуслове или не несёт самостоятельного смысла → keep=false.
 
+keep=false ТОЛЬКО для повторов и незаконченных мыслей. Всё остальное — keep=true.
+
+Верни строго JSON без лишнего текста:
+{"analysis": "...", "segments": [{"index": 0, "keep": true, "reason": ""}]}
+В "analysis" перечисли найденные группы повторов с индексами сегментов."""
+
+
+def _build_importance_prompt(total_duration: float, max_sec: float) -> str:
+    total_min = total_duration / 60
+    max_min   = max_sec / 60
+    return f"""Ты — видеомонтажёр для YouTube. Тебе дана транскрипция, уже ОЧИЩЕННАЯ от повторов.
+
+КОНТЕКСТ ВИДЕО:
+{config.VIDEO_CONTEXT}
+
+Исходный хронометраж: ~{total_min:.0f} мин
+Лимит итогового видео: {max_min:.0f} мин ({max_sec:.0f}с) — но только если нужно (см. ниже)
+
+Паузы (тишина) уже вырезаны до тебя. Ты работаешь только с речевыми сегментами.
+
 ═══════════════════════════════════════════════
-ПРИОРИТЕТ 2 — УСЛОВНЫЙ
+ПАУЗЫ МЕЖДУ СЕГМЕНТАМИ
 ═══════════════════════════════════════════════
-Выполняй ТОЛЬКО если после Приоритета 1 хронометраж всё ещё превышает {max_sec:.0f}с.
-Тогда дополнительно удаляй менее важное, пока не уложишься в лимит:
+Между сегментами указана длина молчания (═══ пауза Xс ═══).
+- Длинная пауза (≥ 10с) — граница между частями процесса.
+- Короткая пауза (< 5с) — нормальный ритм речи.
+
+═══════════════════════════════════════════════
+ЗАДАЧА — УСЛОВНАЯ
+═══════════════════════════════════════════════
+Если суммарный хронометраж сегментов НЕ превышает {max_sec:.0f}с — оставь всё как есть
+(keep=true, score по важности). Удалять ничего не нужно.
+
+Если суммарный хронометраж ПРЕВЫШАЕТ {max_sec:.0f}с — удаляй менее важное пока не уложишься:
 - Технические паузы: автор ждёт загрузки, рендера, зависания инструмента
 - Нерелевантные отступления: разговоры не по теме работы
 - Менее важные пояснения (если суть уже раскрыта в других сегментах)
 
-Что НЕ трогать при Приоритете 2:
+Что НЕ трогать:
 - Начало видео (первые связные сегменты где автор обозначает тему)
 - Конец видео (финальный результат, вывод — последние 3–5 сегментов)
 - Ключевые моменты: решения, находки, итерации, смена подхода
@@ -120,16 +133,6 @@ null — обычный контент, не интеграция.
 - Последняя запись → keep=true, score=1.0, integration: "<тип>"
 
 ═══════════════════════════════════════════════
-ОБЯЗАТЕЛЬНАЯ ФАЗА АНАЛИЗА (выполни ДО оценки сегментов)
-═══════════════════════════════════════════════
-Прочитай ВСЕ сегменты целиком. Запиши в поле "analysis":
-1. На какие смысловые части делится видео
-2. Какие мысли повторяются и в каких конкретно сегментах (индексы)
-3. Что точно стоит убрать и почему
-
-Только после этого анализа — расставляй keep/score.
-
-═══════════════════════════════════════════════
 ФОРМАТ ОТВЕТА
 ═══════════════════════════════════════════════
 Верни строго JSON без лишнего текста:
@@ -137,13 +140,7 @@ null — обычный контент, не интеграция.
 
 score=1.0 — ключевой момент, score=0.0 — однозначно вырезать.
 reason — одна фраза, зачем оставляем или почему убираем.
-integration — "youtube", "social", или null.
-
-ФИНАЛЬНАЯ ПРОВЕРКА перед ответом:
-1. Пройдись по всем keep=true сегментам. Для каждого — есть ли рядом другие с той же сутью?
-   Из каждой группы повторов оставь только самую полную/чёткую, остальным — keep=false.
-
-2. Суммарный хронометраж keep=true превышает {max_sec:.0f}с? → применяй Приоритет 2."""
+integration — "youtube", "social", или null."""
 
 
 def _build_highlights_prompt(segments: List[Dict], max_sec: float) -> str:
@@ -188,17 +185,17 @@ def _build_highlights_prompt(segments: List[Dict], max_sec: float) -> str:
     return "\n".join(lines)
 
 
+# ── Основной класс ────────────────────────────────────────────────────────────
+
 class LLMAnalyzer:
 
     def analyze(self, segments: List[Dict], max_sec: float = None) -> List[Dict]:
         """
-        Полный анализ транскрипции. Возвращает сегменты с полями score, keep, reason.
+        Полный анализ транскрипции. Два последовательных LLM-вызова:
+          1. Удалить ВСЕ повторы и незаконченные мысли (всегда)
+          2. Оценить важность оставшихся, найти интеграции, уложиться в лимит (если нужно)
 
-        Приоритеты:
-          1. Удалить ВСЕ повторы и фальстарты (всегда, даже если результат < max_sec)
-          2. Если после п.1 хронометраж > max_sec — дополнительно убрать менее важное
-
-        max_sec: лимит итогового видео в секундах (по умолчанию FORMAT_1)
+        Возвращает сегменты с полями score, keep, reason, integration.
         """
         if not segments:
             return []
@@ -207,38 +204,35 @@ class LLMAnalyzer:
             max_sec = config.FORMAT_1["max_duration_sec"]
 
         total_duration = sum(s["end"] - s["start"] for s in segments)
-        total_chars    = sum(len(s.get("text", "")) for s in segments)
-        max_chars      = config.LLM_CHUNK_SIZE_TOKENS * 4
+        log.info(
+            f"LLM анализ: {len(segments)} сег., "
+            f"{total_duration/60:.1f} мин → лимит {max_sec/60:.1f} мин"
+        )
 
-        system = _build_system_prompt(total_duration, max_sec)
+        # Проход 1: найти повторы (все сегменты целиком, без чанков)
+        repeat_marked = self._detect_repeats(segments)
+        non_repeats   = [s for s in repeat_marked if s.get("keep", True)]
 
-        if total_chars <= max_chars:
-            log.info(
-                f"LLM анализ: {len(segments)} сегментов, "
-                f"{total_duration/60:.1f} мин → лимит {max_sec/60:.1f} мин"
-            )
-            result = self._analyze_chunk(segments, system)
-        else:
-            chunks = self._split_into_chunks(segments)
-            log.info(
-                f"LLM анализ: {len(segments)} сегментов, {len(chunks)} чанков, "
-                f"{total_duration/60:.1f} мин → лимит {max_sec/60:.1f} мин"
-            )
-            result = []
-            for i, chunk in enumerate(chunks):
-                log.info(f"Анализирую чанк {i+1}/{len(chunks)} ({len(chunk)} сегментов)...")
-                result.extend(self._analyze_chunk(chunk, system))
+        # Проход 2: оценить важность очищенных сегментов
+        scored = self._score_importance(non_repeats, max_sec)
+
+        # Собрать финальный список: повторы (keep=False) + оценённые сегменты
+        scored_iter = iter(scored)
+        result = []
+        for seg in repeat_marked:
+            if seg.get("keep", True):
+                result.append(next(scored_iter))
+            else:
+                result.append(seg)
 
         kept = sum(1 for s in result if s.get("keep"))
-        log.info(f"LLM: оставлено {kept}/{len(result)} сегментов")
+        log.info(f"LLM итого: оставлено {kept}/{len(result)} сегментов")
         return result
 
     def analyze_highlights(self, segments: List[Dict], max_sec: float) -> List[Dict]:
         """
-        Второй проход: из уже отобранных сегментов (10-мин таймлайн) выбирает
+        Третий проход: из уже отобранных сегментов (10-мин таймлайн) выбирает
         лучшие max_sec секунд для 3-минутной версии.
-
-        Возвращает те же сегменты с обновлёнными keep/score.
         """
         if not segments:
             return []
@@ -256,10 +250,10 @@ class LLMAnalyzer:
         last_error = None
         for attempt in range(config.LLM_MAX_RETRIES):
             try:
-                raw = self._call_api_with_system(system, user)
+                raw    = self._call_api_with_system(system, user)
                 scored = self._parse_response(raw, len(segments))
                 result = self._apply_scores(segments, scored)
-                kept = sum(1 for s in result if s.get("keep"))
+                kept     = sum(1 for s in result if s.get("keep"))
                 kept_dur = sum(s["end"] - s["start"] for s in result if s.get("keep"))
                 log.info(f"LLM хайлайты: {kept} сегментов, {kept_dur:.0f}с")
                 return result
@@ -272,7 +266,62 @@ class LLMAnalyzer:
         log.error(f"⚠️ LLM хайлайты не ответил: {last_error}. Проверь OPENROUTER_API_KEY и баланс.")
         return self._apply_scores(segments, [])
 
-    # ── Разбивка на чанки (fallback для очень длинных видео) ─────────────────
+    # ── Проход 1: повторы ─────────────────────────────────────────────────────
+
+    def _detect_repeats(self, segments: List[Dict]) -> List[Dict]:
+        """
+        Находит повторы и незаконченные мысли. Всё остальное — keep=True.
+        Обрабатывает все сегменты ЦЕЛИКОМ (без чанков) — иначе не найти cross-chunk повторы.
+        """
+        system      = _build_repeats_system_prompt()
+        user_prompt = self._build_repeats_user_prompt(segments)
+
+        last_error = None
+        for attempt in range(config.LLM_MAX_RETRIES):
+            try:
+                raw    = self._call_api_with_system(system, user_prompt)
+                scored = self._parse_response(raw, len(segments))
+                result = self._apply_scores(segments, scored)
+                removed = sum(1 for s in result if not s.get("keep"))
+                log.info(f"Повторы: убрано {removed}/{len(segments)} сегментов")
+                return result
+            except Exception as e:
+                last_error = e
+                wait = 2 ** attempt
+                log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES}: {e}. Жду {wait}с...")
+                time.sleep(wait)
+
+        log.error(f"⚠️ LLM (повторы) не ответил: {last_error}. Оставляю все сегменты.")
+        return self._apply_scores(segments, [])
+
+    # ── Проход 2: важность ────────────────────────────────────────────────────
+
+    def _score_importance(self, segments: List[Dict], max_sec: float) -> List[Dict]:
+        """
+        Оценивает важность, обнаруживает интеграции, применяет лимит длительности.
+        Предполагает что повторов в segments уже нет.
+        """
+        if not segments:
+            return []
+
+        total_duration = sum(s["end"] - s["start"] for s in segments)
+        total_chars    = sum(len(s.get("text", "")) for s in segments)
+        max_chars      = config.LLM_CHUNK_SIZE_TOKENS * 4
+        system         = _build_importance_prompt(total_duration, max_sec)
+
+        if total_chars <= max_chars:
+            log.info(f"LLM важность: {len(segments)} сег., {total_duration/60:.1f} мин")
+            return self._analyze_chunk(segments, system)
+
+        chunks = self._split_into_chunks(segments)
+        log.info(f"LLM важность: {len(segments)} сег., {len(chunks)} чанков")
+        result = []
+        for i, chunk in enumerate(chunks):
+            log.info(f"Важность чанк {i+1}/{len(chunks)} ({len(chunk)} сег.)...")
+            result.extend(self._analyze_chunk(chunk, system))
+        return result
+
+    # ── Разбивка на чанки ─────────────────────────────────────────────────────
 
     def _split_into_chunks(self, segments: List[Dict]) -> List[List[Dict]]:
         max_chars = config.LLM_CHUNK_SIZE_TOKENS * 4
@@ -303,21 +352,21 @@ class LLMAnalyzer:
         for attempt in range(config.LLM_MAX_RETRIES):
             try:
                 raw_response = self._call_api_with_system(system_prompt, user_prompt)
-                scored = self._parse_response(raw_response, len(chunk))
+                scored       = self._parse_response(raw_response, len(chunk))
                 return self._apply_scores(chunk, scored)
-
             except Exception as e:
                 last_error = e
                 wait = 2 ** attempt
                 log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES} не удалась: {e}. Жду {wait}с...")
                 time.sleep(wait)
 
-        log.error(f"⚠️ LLM НЕ ОТВЕТИЛ после {config.LLM_MAX_RETRIES} попыток: {last_error}. "
-                  f"Все сегменты будут сохранены (fallback). Проверь OPENROUTER_API_KEY и баланс.")
+        log.error(
+            f"⚠️ LLM НЕ ОТВЕТИЛ после {config.LLM_MAX_RETRIES} попыток: {last_error}. "
+            f"Все сегменты будут сохранены (fallback). Проверь OPENROUTER_API_KEY и баланс."
+        )
         return self._apply_scores(chunk, [])
 
     def _call_api_with_system(self, system: str, user: str) -> str:
-        """Делает HTTP запрос к OpenRouter API, возвращает текст ответа."""
         response = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
@@ -339,10 +388,27 @@ class LLMAnalyzer:
         data = response.json()
         return data["choices"][0]["message"]["content"]
 
-    # ── Промпт ────────────────────────────────────────────────────────────────
+    # ── Построение промптов ───────────────────────────────────────────────────
+
+    def _build_repeats_user_prompt(self, segments: List[Dict]) -> str:
+        lines = ["Вот полная транскрипция видео. Найди все повторы:\n"]
+        for i, seg in enumerate(segments):
+            start = _fmt_time(seg["start"])
+            end   = _fmt_time(seg["end"])
+            text  = seg.get("text", "").strip() or "[тишина]"
+            lines.append(f"[{i}] {start}–{end}  {text}")
+            if i < len(segments) - 1:
+                pause = segments[i + 1]["start"] - seg["end"]
+                if pause >= 3:
+                    lines.append(f"    ═══ пауза {pause:.0f}с ═══")
+
+        lines.append(
+            '\nВерни JSON: {"analysis": "...", "segments": [{"index": 0, "keep": true, "reason": ""}, ...]}'
+        )
+        return "\n".join(lines)
 
     def _build_prompt(self, segments: List[Dict]) -> str:
-        lines = ["Вот полная транскрипция видео. Оцени каждый сегмент:\n"]
+        lines = ["Вот транскрипция видео (очищена от повторов). Оцени важность каждого сегмента:\n"]
         for i, seg in enumerate(segments):
             start = _fmt_time(seg["start"])
             end   = _fmt_time(seg["end"])
@@ -355,41 +421,37 @@ class LLMAnalyzer:
 
         lines.append(
             "\nВерни JSON: "
-            '{"analysis": "...", "segments": [{"index": 0, "score": 0.0, "keep": false, "reason": "..."}, ...]}'
+            '{"analysis": "...", "segments": [{"index": 0, "score": 0.0, "keep": false, "reason": "...", "integration": null}, ...]}'
         )
         return "\n".join(lines)
 
     # ── Парсинг ответа ────────────────────────────────────────────────────────
 
     def _parse_response(self, text: str, expected_count: int) -> List[Dict]:
-        # Снимаем markdown-обёртку (```json ... ```)
         text = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.IGNORECASE)
         text = re.sub(r'\s*```\s*$', '', text)
 
-        # Попытка 1: прямой парсинг
         try:
             data = json.loads(text)
             if isinstance(data, dict) and "segments" in data:
                 if "analysis" in data:
-                    log.info(f"LLM анализ видео: {data['analysis']}")
+                    log.info(f"LLM анализ: {data['analysis'][:200]}")
                 return data["segments"]
             if isinstance(data, list):
                 return data
         except json.JSONDecodeError:
             pass
 
-        # Попытка 2: извлечь JSON-объект из текста (жадный поиск — берём наибольший объект)
         match = re.search(r'\{.*"segments"\s*:\s*\[.*\]\s*\}', text, re.DOTALL)
         if match:
             try:
                 data = json.loads(match.group())
                 if "analysis" in data:
-                    log.info(f"LLM анализ видео: {data['analysis']}")
+                    log.info(f"LLM анализ: {data['analysis'][:200]}")
                 return data.get("segments", [])
             except json.JSONDecodeError:
                 pass
 
-        # Попытка 3: найти JSON-массив объектов (жадный; проверяем что элементы — dict, не int)
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if match:
             try:
@@ -434,7 +496,6 @@ class LLMAnalyzer:
 # ── Утилита ───────────────────────────────────────────────────────────────────
 
 def _fmt_time(seconds: float) -> str:
-    """Форматирует секунды в MM:SS для промпта."""
     m = int(seconds // 60)
     s = int(seconds % 60)
     return f"{m}:{s:02d}"
