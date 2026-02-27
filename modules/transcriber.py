@@ -105,6 +105,7 @@ class Transcriber:
             str(audio_file),
             language=config.WHISPER_LANGUAGE,
             word_timestamps=True,
+            vad_filter=True,   # Silero VAD: только реальная речь → точные таймстемпы слов
         )
 
         # Извлекаем плоский список слов из всех сегментов Whisper
