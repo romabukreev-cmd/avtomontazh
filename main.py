@@ -114,10 +114,9 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
     # Разделяем сегменты по типу интеграции
     # Вертикальные форматы: убираем youtube-интеграции (оставляем social)
     kept_vertical   = [s for s in kept if s.get("integration") != "youtube"]
-    # Горизонтальный формат: убираем social-интеграции (оставляем youtube)
-    kept_horizontal = [s for s in kept if s.get("integration") != "social"]
-    # Хайлайты (3 мин): только чистый контент, без любых интеграций
-    kept_content    = [s for s in kept if not s.get("integration")]
+    # TEMP DISABLED: горизонтальный и хайлайты отключены для ускорения тестирования
+    # kept_horizontal = [s for s in kept if s.get("integration") != "social"]
+    # kept_content    = [s for s in kept if not s.get("integration")]
 
     builder = TimelineBuilder()
     timeline_vertical = builder.build_long(
@@ -125,46 +124,38 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
         max_sec=config.FORMAT_1["max_duration_sec"],
         video_duration=video_duration,
     )
-    timeline_horizontal = builder.build_long(
-        kept_horizontal,
-        max_sec=config.FORMAT_3["max_duration_sec"],
-        video_duration=video_duration,
-    )
+    # TEMP DISABLED:
+    # timeline_horizontal = builder.build_long(
+    #     kept_horizontal,
+    #     max_sec=config.FORMAT_3["max_duration_sec"],
+    #     video_duration=video_duration,
+    # )
     dur_vert  = builder.total_duration(timeline_vertical)
-    dur_horiz = builder.total_duration(timeline_horizontal)
-    log.info(f"Таймлайн вертикальный: {format_duration(dur_vert)}, горизонтальный: {format_duration(dur_horiz)}")
+    log.info(f"Таймлайн вертикальный: {format_duration(dur_vert)}")
 
-    # Второй LLM-проход: хайлайты из чистого контента вертикального таймлайна
-    long_start_ends = {(round(s["start"], 1), round(s["end"], 1)) for s in timeline_vertical}
-    long_segments = [
-        s for s in kept_content
-        if any(
-            s["start"] >= ts - 0.6 and s["end"] <= te + 0.6
-            for ts, te in long_start_ends
-        )
-    ]
-    if not long_segments:
-        long_segments = kept_content  # fallback
-
-    progress(
-        f"▶ <b>{session.name}</b>\n\n"
-        "✅ Файлы готовы\n"
-        f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
-        f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
-        f"✅ Таймлайн: {format_duration(dur_vert)} (верт.) / {format_duration(dur_horiz)} (гориз.)\n"
-        "⏳ AI выбирает хайлайты (3 мин)..."
-    )
-    highlights_scored = analyzer.analyze_highlights(
-        long_segments,
-        max_sec=config.FORMAT_2["max_duration_sec"],
-    )
-    timeline_highlight = builder.build_highlights(
-        highlights_scored,
-        video_duration=video_duration,
-        max_sec=config.FORMAT_2["max_duration_sec"],
-    )
-    dur_hl = builder.total_duration(timeline_highlight)
-    log.info(f"Хайлайты: {format_duration(dur_hl)}")
+    # TEMP DISABLED: хайлайты отключены для ускорения тестирования
+    # long_start_ends = {(round(s["start"], 1), round(s["end"], 1)) for s in timeline_vertical}
+    # long_segments = [
+    #     s for s in kept_content
+    #     if any(
+    #         s["start"] >= ts - 0.6 and s["end"] <= te + 0.6
+    #         for ts, te in long_start_ends
+    #     )
+    # ]
+    # if not long_segments:
+    #     long_segments = kept_content
+    #
+    # highlights_scored = analyzer.analyze_highlights(
+    #     long_segments,
+    #     max_sec=config.FORMAT_2["max_duration_sec"],
+    # )
+    # timeline_highlight = builder.build_highlights(
+    #     highlights_scored,
+    #     video_duration=video_duration,
+    #     max_sec=config.FORMAT_2["max_duration_sec"],
+    # )
+    # dur_hl = builder.total_duration(timeline_highlight)
+    # log.info(f"Хайлайты: {format_duration(dur_hl)}")
 
 
     # ── Шаг 4: Рендер трёх форматов ───────────────────────────────────────────
@@ -184,31 +175,29 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
                 "✅ Файлы готовы\n"
                 f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
                 f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
-                f"✅ Таймлайн: {format_duration(dur_vert)} / хайлайты {format_duration(dur_hl)}\n"
-                f"⏳ Рендер {format_num}/3 ({format_label}): [{bar}] {pct:.0f}%"
+                f"✅ Таймлайн: {format_duration(dur_vert)} (верт.)\n"
+                f"⏳ Рендер {format_num}/1 ({format_label}): [{bar}] {pct:.0f}%"
             )
         return cb
 
-    # Формат 1 — вертикальный 9:16, 10 минут (social-интеграция)
+    # Формат 1 — вертикальный 9:16, 9 минут (social-интеграция)
     renderer.render_vertical(
         timeline_vertical, output_dir,
         output_filename="vertical_9min.mp4",
         progress_callback=make_render_progress(1, "верт. 9мин"),
     )
 
-    # Формат 2 — вертикальный 9:16, 2 минуты (хайлайты, без интеграции)
-    renderer.render_vertical(
-        timeline_highlight, output_dir,
-        output_filename="vertical_2min.mp4",
-        progress_callback=make_render_progress(2, "верт. 2мин"),
-    )
-
-    # Формат 3 — горизонтальный 16:9, 9 минут (youtube-интеграция)
-    renderer.render_horizontal(
-        timeline_horizontal, output_dir,
-        output_filename="horizontal_9min.mp4",
-        progress_callback=make_render_progress(3, "гориз. 9мин"),
-    )
+    # TEMP DISABLED: форматы 2 и 3 отключены для ускорения тестирования
+    # renderer.render_vertical(
+    #     timeline_highlight, output_dir,
+    #     output_filename="vertical_2min.mp4",
+    #     progress_callback=make_render_progress(2, "верт. 2мин"),
+    # )
+    # renderer.render_horizontal(
+    #     timeline_horizontal, output_dir,
+    #     output_filename="horizontal_9min.mp4",
+    #     progress_callback=make_render_progress(3, "гориз. 9мин"),
+    # )
 
     # Итоговый саммари — остаётся предпоследним сообщением (перед уведомлением о загрузке)
     progress(
@@ -216,8 +205,8 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
         f"✅ Файлы готовы\n"
         f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
         f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
-        f"✅ Таймлайн: {format_duration(dur_vert)} (верт.) / хайлайты {format_duration(dur_hl)}\n"
-        f"✅ Рендер ×3 завершён"
+        f"✅ Таймлайн: {format_duration(dur_vert)} (верт.)\n"
+        f"✅ Рендер завершён"
     )
 
     log.info(f"✅ Обработка завершена: {session.name}")
