@@ -35,7 +35,7 @@ VIDEO_EXTENSIONS    = {".mp4", ".mkv", ".avi", ".mov", ".ts"}
 # small    — хороший баланс скорости и точности для русского
 # medium   — заметно лучше для русского, ~2x медленнее small
 # large-v3 — лучшее качество для русского, ~4x медленнее small
-WHISPER_MODEL    = "large-v3"
+WHISPER_MODEL    = "small"
 WHISPER_LANGUAGE = "ru"   # явно указываем русский для точности
 
 # Пауза: отрезок тишины длиннее порога будет вырезан
