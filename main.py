@@ -121,7 +121,7 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
     builder = TimelineBuilder()
     timeline_vertical = builder.build_long(
         kept_vertical,
-        max_sec=config.FORMAT_1["max_duration_sec"],
+        max_sec=float("inf"),   # TEMP: без обрезки по длительности
         video_duration=video_duration,
     )
     # TEMP DISABLED:
