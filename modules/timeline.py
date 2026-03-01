@@ -43,6 +43,10 @@ class TimelineBuilder:
         for seg in kept:
             cuts.extend(self._cut_segment(seg))
 
+        # Первый отрезок начинается с 0.0 — убираем тишину в начале видео
+        if cuts:
+            cuts[0]["start"] = 0.0
+
         total = self.total_duration(cuts)
         log.info(f"Таймлайн: {len(cuts)} отрезков, {total:.1f}с")
         return cuts
