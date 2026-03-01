@@ -43,9 +43,22 @@ class TimelineBuilder:
         for seg in kept:
             cuts.extend(self._cut_segment(seg))
 
-        # Первый отрезок начинается с 0.0 — убираем тишину в начале видео
-        if cuts:
-            cuts[0]["start"] = 0.0
+        if not cuts:
+            return []
+
+        cuts.sort(key=lambda c: c["start"])
+
+        # Сливаем перекрывающиеся срезы.
+        # Перекрытие возникает когда два соседних Whisper-сегмента разделены паузой
+        # меньше 2×PAUSE_BUFFER_SEC (0.4с): буфер одного залезает в буфер другого.
+        merged = [dict(cuts[0])]
+        for cut in cuts[1:]:
+            last = merged[-1]
+            if cut["start"] <= last["end"]:
+                last["end"] = max(last["end"], cut["end"])
+            else:
+                merged.append(dict(cut))
+        cuts = merged
 
         total = self.total_duration(cuts)
         log.info(f"Таймлайн: {len(cuts)} отрезков, {total:.1f}с")
