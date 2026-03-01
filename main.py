@@ -90,36 +90,10 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
         "⏳ Строю таймлайн..."
     )
 
-    kept_vertical = [s for s in kept if s.get("integration") != "youtube"]
-
     builder = TimelineBuilder()
-    timeline_vertical = builder.build(kept_vertical)
+    timeline_vertical = builder.build(kept)
     dur_vert = builder.total_duration(timeline_vertical)
     log.info(f"Таймлайн: {format_duration(dur_vert)}")
-
-    # TEMP DISABLED: хайлайты отключены для ускорения тестирования
-    # long_start_ends = {(round(s["start"], 1), round(s["end"], 1)) for s in timeline_vertical}
-    # long_segments = [
-    #     s for s in kept_content
-    #     if any(
-    #         s["start"] >= ts - 0.6 and s["end"] <= te + 0.6
-    #         for ts, te in long_start_ends
-    #     )
-    # ]
-    # if not long_segments:
-    #     long_segments = kept_content
-    #
-    # highlights_scored = analyzer.analyze_highlights(
-    #     long_segments,
-    #     max_sec=config.FORMAT_2["max_duration_sec"],
-    # )
-    # timeline_highlight = builder.build_highlights(
-    #     highlights_scored,
-    #     video_duration=video_duration,
-    #     max_sec=config.FORMAT_2["max_duration_sec"],
-    # )
-    # dur_hl = builder.total_duration(timeline_highlight)
-    # log.info(f"Хайлайты: {format_duration(dur_hl)}")
 
 
     # ── Шаг 4: Рендер ────────────────────────────────────────────────────────
