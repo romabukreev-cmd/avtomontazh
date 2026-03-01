@@ -69,25 +69,30 @@ class LLMAnalyzer:
     def analyze(self, segments: List[Dict]) -> List[Dict]:
         """
         Отправляет всю транскрипцию в Claude одним запросом.
-        Возвращает сегменты с полем keep=true/false и reason.
+
+        Перед отправкой дробит Whisper-сегменты на мелкие фразы по паузам >= PHRASE_SPLIT_SEC.
+        Это даёт LLM возможность удалять повторы внутри одного Whisper-сегмента.
+
+        Возвращает фразы с полем keep=True/False.
         """
         if not segments:
             return []
 
-        total_duration = sum(s["end"] - s["start"] for s in segments)
-        log.info(f"LLM анализ: {len(segments)} сег., {total_duration/60:.1f} мин")
+        phrases = self._split_to_phrases(segments)
+        total_duration = sum(s["end"] - s["start"] for s in phrases)
+        log.info(f"LLM анализ: {len(phrases)} фраз (из {len(segments)} сег.), {total_duration/60:.1f} мин")
 
         system = _build_system_prompt()
-        user   = _build_user_prompt(segments)
+        user   = _build_user_prompt(phrases)
 
         last_error = None
         for attempt in range(config.LLM_MAX_RETRIES):
             try:
-                raw       = self._call_api(system, user)
-                repeats   = self._parse_response(raw)
-                result    = self._apply_decisions(segments, repeats)
+                raw     = self._call_api(system, user)
+                repeats = self._parse_response(raw)
+                result  = self._apply_decisions(phrases, repeats)
                 kept = sum(1 for s in result if s.get("keep"))
-                log.info(f"LLM итого: оставлено {kept}/{len(result)} сегментов")
+                log.info(f"LLM итого: оставлено {kept}/{len(result)} фраз")
                 return result
             except Exception as e:
                 last_error = e
@@ -95,8 +100,52 @@ class LLMAnalyzer:
                 log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES}: {e}. Жду {wait}с...")
                 time.sleep(wait)
 
-        log.error(f"⚠️ LLM не ответил после {config.LLM_MAX_RETRIES} попыток: {last_error}. Оставляю все сегменты.")
-        return self._apply_decisions(segments, [])  # все keep=True
+        log.error(f"⚠️ LLM не ответил после {config.LLM_MAX_RETRIES} попыток: {last_error}. Оставляю все фразы.")
+        return self._apply_decisions(phrases, [])  # все keep=True
+
+    # ── Дробление на фразы ────────────────────────────────────────────────────
+
+    def _split_to_phrases(self, segments: List[Dict]) -> List[Dict]:
+        """
+        Дробит Whisper-сегменты на мелкие фразы по паузам >= PHRASE_SPLIT_SEC.
+        Каждый Whisper-сегмент обрабатывается независимо (межсегментные паузы тоже разделяют).
+        Возвращает пронумерованный список фраз с пословными timestamps.
+        """
+        phrases = []
+        for seg in segments:
+            words = seg.get("words", [])
+            if not words:
+                # Нет пословных timestamps — берём сегмент целиком как одну фразу
+                phrases.append({
+                    "start": seg["start"], "end": seg["end"],
+                    "text": seg.get("text", ""), "words": [],
+                })
+                continue
+
+            current = [words[0]]
+            for word in words[1:]:
+                gap = word["start"] - current[-1]["end"]
+                if gap >= config.PHRASE_SPLIT_SEC:
+                    phrases.append(self._words_to_phrase(current))
+                    current = [word]
+                else:
+                    current.append(word)
+            phrases.append(self._words_to_phrase(current))
+
+        # Нумеруем фразы для LLM (index = позиция в списке)
+        for i, p in enumerate(phrases):
+            p["index"] = i
+
+        log.info(f"Фраз после дробления: {len(phrases)} (порог: {config.PHRASE_SPLIT_SEC}с)")
+        return phrases
+
+    def _words_to_phrase(self, words: List[Dict]) -> Dict:
+        return {
+            "start": words[0]["start"],
+            "end":   words[-1]["end"],
+            "text":  " ".join(w["word"] for w in words).strip(),
+            "words": words,
+        }
 
     # ── API ───────────────────────────────────────────────────────────────────
 
