@@ -1,17 +1,15 @@
 """
 main.py — точка входа системы Автомонтаж.
 
-Запуск:
-    python main.py
-
-Система запускает Telegram-бота который:
-  - Принимает команды от пользователя (/sync, /sessions, /status)
-  - По команде запускает полный пайплайн обработки видео
-  - Присылает прогресс и уведомление о завершении
+Пайплайн:
+  1. Concat файлов сессии
+  2. Whisper транскрипция → сегменты с пословными timestamps
+  3. LLM (Claude Sonnet) → keep/remove для каждого сегмента
+  4. Timeline → нарезка пауз > 0.6с с буфером 0.2с
+  5. FFmpeg рендер → вертикальное видео 1080×1920
 """
 
 import logging
-import subprocess
 import sys
 from typing import Callable
 
@@ -55,8 +53,6 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
 
 
     # ── Шаг 1: Транскрипция ───────────────────────────────────────────────────
-    # Whisper транскрибирует аудио записи экрана.
-    # Возвращает список сегментов речи с таймстемпами (паузы > 1.5с удалены).
 
     progress(
         f"▶ <b>{session.name}</b>\n\n"
@@ -64,74 +60,42 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
         "⏳ Транскрибирую аудио через Whisper...\n"
         "<i>(это может занять несколько минут)</i>"
     )
-    speech_segments = transcriber.transcribe_and_cut_pauses(screen_file)
-    total_speech = sum(s["end"] - s["start"] for s in speech_segments)
-    log.info(f"Транскрипция: {len(speech_segments)} сегментов, {format_duration(total_speech)} речи")
+    segments = transcriber.transcribe(screen_file)
+    total_speech = sum(s["end"] - s["start"] for s in segments)
+    log.info(f"Транскрипция: {len(segments)} сегментов, {format_duration(total_speech)} речи")
 
 
-    # ── Шаг 2: LLM-анализ контента ───────────────────────────────────────────
-    # Транскрипция отправляется в LLM (OpenRouter).
-    # LLM оценивает каждый сегмент и помечает: оставить или вырезать.
+    # ── Шаг 2: LLM-анализ ────────────────────────────────────────────────────
 
     progress(
         f"▶ <b>{session.name}</b>\n\n"
         "✅ Файлы готовы\n"
-        f"✅ Транскрипция: {len(speech_segments)} сегментов ({format_duration(total_speech)})\n"
+        f"✅ Транскрипция: {len(segments)} сегментов ({format_duration(total_speech)})\n"
         "⏳ AI анализирует контент..."
     )
     analyzer = LLMAnalyzer()
-    scored_segments = analyzer.analyze(speech_segments)
+    scored_segments = analyzer.analyze(segments)
     kept = [s for s in scored_segments if s["keep"]]
     kept_duration = sum(s["end"] - s["start"] for s in kept)
     log.info(f"LLM-анализ: оставлено {len(kept)}/{len(scored_segments)} ({format_duration(kept_duration)})")
 
 
-    # ── Шаг 3: Построение таймлайна ───────────────────────────────────────────
-    # TimelineBuilder собирает три таймлайна:
-    #   - вертикальный (social-интеграция, до 10 минут) → Форматы 1 и 2
-    #   - горизонтальный (youtube-интеграция, до 10 минут) → Формат 3
-    #   - хайлайты (второй LLM-проход, без интеграций, до 3 минут) → Формат 2
+    # ── Шаг 3: Таймлайн ──────────────────────────────────────────────────────
 
     progress(
         f"▶ <b>{session.name}</b>\n\n"
         "✅ Файлы готовы\n"
-        f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
+        f"✅ Транскрипция: {len(segments)} сег. ({format_duration(total_speech)})\n"
         f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
         "⏳ Строю таймлайн..."
     )
 
-    # Длительность исходного видео (для корректного padding в timeline builder)
-    _probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(screen_file)],
-        capture_output=True, text=True,
-    )
-    try:
-        video_duration = float(_probe.stdout.strip())
-    except ValueError:
-        video_duration = None
-
-    # Разделяем сегменты по типу интеграции
-    # Вертикальные форматы: убираем youtube-интеграции (оставляем social)
-    kept_vertical   = [s for s in kept if s.get("integration") != "youtube"]
-    # TEMP DISABLED: горизонтальный и хайлайты отключены для ускорения тестирования
-    # kept_horizontal = [s for s in kept if s.get("integration") != "social"]
-    # kept_content    = [s for s in kept if not s.get("integration")]
+    kept_vertical = [s for s in kept if s.get("integration") != "youtube"]
 
     builder = TimelineBuilder()
-    timeline_vertical = builder.build_long(
-        kept_vertical,
-        max_sec=float("inf"),   # TEMP: без обрезки по длительности
-        video_duration=video_duration,
-    )
-    # TEMP DISABLED:
-    # timeline_horizontal = builder.build_long(
-    #     kept_horizontal,
-    #     max_sec=config.FORMAT_3["max_duration_sec"],
-    #     video_duration=video_duration,
-    # )
-    dur_vert  = builder.total_duration(timeline_vertical)
-    log.info(f"Таймлайн вертикальный: {format_duration(dur_vert)}")
+    timeline_vertical = builder.build(kept_vertical)
+    dur_vert = builder.total_duration(timeline_vertical)
+    log.info(f"Таймлайн: {format_duration(dur_vert)}")
 
     # TEMP DISABLED: хайлайты отключены для ускорения тестирования
     # long_start_ends = {(round(s["start"], 1), round(s["end"], 1)) for s in timeline_vertical}
@@ -158,55 +122,36 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
     # log.info(f"Хайлайты: {format_duration(dur_hl)}")
 
 
-    # ── Шаг 4: Рендер трёх форматов ───────────────────────────────────────────
-    # VideoRenderer создаёт три видеофайла через FFmpeg.
-    # progress_callback вызывается с процентом завершения рендера.
+    # ── Шаг 4: Рендер ────────────────────────────────────────────────────────
 
     output_dir = config.OUTPUT_DIR / session.name
     output_dir.mkdir(parents=True, exist_ok=True)
     renderer = VideoRenderer(screen_file, webcam_file, session.name)
 
-    def make_render_progress(format_num: int, format_label: str):
-        """Фабрика колбэка прогресса рендера для каждого формата."""
-        def cb(pct: float) -> None:
-            bar = "▓" * int(pct / 10) + "░" * (10 - int(pct / 10))
-            progress(
-                f"▶ <b>{session.name}</b>\n\n"
-                "✅ Файлы готовы\n"
-                f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
-                f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
-                f"✅ Таймлайн: {format_duration(dur_vert)} (верт.)\n"
-                f"⏳ Рендер {format_num}/1 ({format_label}): [{bar}] {pct:.0f}%"
-            )
-        return cb
+    def render_progress(pct: float) -> None:
+        bar = "▓" * int(pct / 10) + "░" * (10 - int(pct / 10))
+        progress(
+            f"▶ <b>{session.name}</b>\n\n"
+            "✅ Файлы готовы\n"
+            f"✅ Транскрипция: {len(segments)} сег. ({format_duration(total_speech)})\n"
+            f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
+            f"✅ Таймлайн: {format_duration(dur_vert)}\n"
+            f"⏳ Рендер: [{bar}] {pct:.0f}%"
+        )
 
-    # Формат 1 — вертикальный 9:16, 9 минут (social-интеграция)
     renderer.render_vertical(
         timeline_vertical, output_dir,
         output_filename="vertical_9min.mp4",
-        progress_callback=make_render_progress(1, "верт. 9мин"),
+        progress_callback=render_progress,
     )
 
-    # TEMP DISABLED: форматы 2 и 3 отключены для ускорения тестирования
-    # renderer.render_vertical(
-    #     timeline_highlight, output_dir,
-    #     output_filename="vertical_2min.mp4",
-    #     progress_callback=make_render_progress(2, "верт. 2мин"),
-    # )
-    # renderer.render_horizontal(
-    #     timeline_horizontal, output_dir,
-    #     output_filename="horizontal_9min.mp4",
-    #     progress_callback=make_render_progress(3, "гориз. 9мин"),
-    # )
-
-    # Итоговый саммари — остаётся предпоследним сообщением (перед уведомлением о загрузке)
     progress(
         f"✅ <b>{session.name}</b>\n\n"
-        f"✅ Файлы готовы\n"
-        f"✅ Транскрипция: {len(speech_segments)} сег. ({format_duration(total_speech)})\n"
+        "✅ Файлы готовы\n"
+        f"✅ Транскрипция: {len(segments)} сег. ({format_duration(total_speech)})\n"
         f"✅ AI: {len(kept)}/{len(scored_segments)} сег. ({format_duration(kept_duration)})\n"
-        f"✅ Таймлайн: {format_duration(dur_vert)} (верт.)\n"
-        f"✅ Рендер завершён"
+        f"✅ Таймлайн: {format_duration(dur_vert)}\n"
+        "✅ Рендер завершён"
     )
 
     log.info(f"✅ Обработка завершена: {session.name}")
