@@ -21,62 +21,44 @@ log = logging.getLogger(__name__)
 # ── Промпты ───────────────────────────────────────────────────────────────────
 
 def _build_system_prompt() -> str:
-    return f"""Ты — видеомонтажёр. Тебе дана транскрипция видео с временными метками.
-Твоя задача — убрать повторы и незаконченные дубли.
+    return """Ты редактор видео-транскрипций. Твоя задача — найти все места где автор повторяет одну и ту же мысль несколько раз подряд, и оставить только финальную попытку.
 
-КОНТЕКСТ ВИДЕО:
-{config.VIDEO_CONTEXT}
+Важно: Повторы могут быть как внутри одного временного блока, так и на стыке нескольких блоков подряд. Анализируй весь текст целиком, не блоками.
 
-═══════════════════════════════════════════════
-ЧТО УБИРАТЬ
-═══════════════════════════════════════════════
+Что считается повтором:
+Автор говорит одну и ту же мысль разными словами несколько раз подряд. Это не пересказ — это попытки сформулировать одно и то же. Между попытками нет новой информации, только переформулировка.
 
-ПОВТОРЫ:
-Автор говорит одну и ту же мысль несколько раз подряд — между попытками нет новой информации.
-Из группы повторов оставь одну версию — самую полную и чёткую (обычно последнюю).
-keep=false для всех остальных версий в группе.
+Примеры повторов:
+- "Итак, давайте сделаем карточку" → "Итак, давайте нарисуем карточку" → оставляем последнее
+- "Отправляюсь в синтекс" → "Отправляюсь синтакс дизайн" → "Отправляю синтакс раздел Design" → оставляем последнее
+- "перед этим перемещу" × 3 подряд → оставляем одно
 
-Примеры:
-- «Итак, давайте сделаем карточку» → «Итак, давайте нарисуем карточку» → оставляем последнее
-- «Отправляюсь в синтекс» → «Отправляюсь синтакс дизайн» → «Отправляю синтакс, раздел Design» → последнее
-- «перед этим перемещу» × 3 подряд → оставляем одно
+Что НЕ является повтором:
+- Автор возвращается к теме через несколько минут с новой информацией
+- Автор подводит итог того что уже сделал
+- Автор объясняет зачем он что-то делает
 
-НЕЗАКОНЧЕННЫЕ ДУБЛИ:
-Сегмент обрывается на полуслове или не несёт самостоятельного смысла → keep=false.
+Формат ответа — строго JSON, без пояснений до и после:
+{"repeats": [{"delete": [0, 1], "keep": 2, "reason": "почему это повтор"}]}
 
-═══════════════════════════════════════════════
-ЧТО НЕ УБИРАТЬ
-═══════════════════════════════════════════════
-- Автор возвращается к теме с новой информацией
-- Автор подводит итог или объясняет зачем что-то делает
-- Любые призывы к действию, упоминания ссылок, кодовых слов — оставляем как есть
-
-═══════════════════════════════════════════════
-ФОРМАТ ОТВЕТА
-═══════════════════════════════════════════════
-Верни строго JSON без лишнего текста:
-{{"analysis": "...", "segments": [{{"index": 0, "keep": true, "reason": "кратко"}}, ...]}}
-
-analysis — 2-3 предложения: что нашёл, что убрал.
-reason — одна фраза: зачем оставляем или почему убираем."""
+delete — список индексов сегментов которые удалить.
+keep — индекс сегмента который оставить.
+reason — одна фраза почему это повтор.
+Если повторов нет — верни {"repeats": []}"""
 
 
 def _build_user_prompt(segments: List[Dict]) -> str:
-    lines = ["Полная транскрипция видео:\n"]
+    lines = [f"Проанализируй эту транскрипцию:\n"]
     for i, seg in enumerate(segments):
         start = _fmt_time(seg["start"])
         end   = _fmt_time(seg["end"])
-        dur   = seg["end"] - seg["start"]
         text  = seg.get("text", "").strip() or "[тишина]"
-        lines.append(f"[{i}] {start}–{end} ({dur:.0f}с)  {text}")
+        lines.append(f"[{i}] {start}–{end}  {text}")
         if i < len(segments) - 1:
             pause = segments[i + 1]["start"] - seg["end"]
             if pause >= 3:
                 lines.append(f"    ═══ пауза {pause:.0f}с ═══")
 
-    lines.append(
-        '\nВерни JSON: {"analysis": "...", "segments": [{"index": 0, "keep": true, "reason": "..."}, ...]}'
-    )
     return "\n".join(lines)
 
 
@@ -102,8 +84,8 @@ class LLMAnalyzer:
         for attempt in range(config.LLM_MAX_RETRIES):
             try:
                 raw       = self._call_api(system, user)
-                decisions = self._parse_response(raw, len(segments))
-                result    = self._apply_decisions(segments, decisions)
+                repeats   = self._parse_response(raw)
+                result    = self._apply_decisions(segments, repeats)
                 kept = sum(1 for s in result if s.get("keep"))
                 log.info(f"LLM итого: оставлено {kept}/{len(result)} сегментов")
                 return result
@@ -114,7 +96,7 @@ class LLMAnalyzer:
                 time.sleep(wait)
 
         log.error(f"⚠️ LLM не ответил после {config.LLM_MAX_RETRIES} попыток: {last_error}. Оставляю все сегменты.")
-        return self._apply_decisions(segments, [])
+        return self._apply_decisions(segments, [])  # все keep=True
 
     # ── API ───────────────────────────────────────────────────────────────────
 
@@ -141,48 +123,49 @@ class LLMAnalyzer:
 
     # ── Парсинг ───────────────────────────────────────────────────────────────
 
-    def _parse_response(self, text: str, expected_count: int) -> List[Dict]:
+    def _parse_response(self, text: str) -> List[Dict]:
         text = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.IGNORECASE)
         text = re.sub(r'\s*```\s*$', '', text)
 
         try:
             data = json.loads(text)
-            if isinstance(data, dict) and "segments" in data:
-                if "analysis" in data:
-                    log.info(f"LLM анализ: {data['analysis'][:300]}")
-                return data["segments"]
-            if isinstance(data, list):
-                return data
+            if isinstance(data, dict) and "repeats" in data:
+                return data["repeats"]
         except json.JSONDecodeError:
             pass
 
-        match = re.search(r'\{.*"segments"\s*:\s*\[.*\]\s*\}', text, re.DOTALL)
+        match = re.search(r'\{.*"repeats"\s*:\s*\[.*\]\s*\}', text, re.DOTALL)
         if match:
             try:
                 data = json.loads(match.group())
-                if "analysis" in data:
-                    log.info(f"LLM анализ: {data['analysis'][:300]}")
-                return data.get("segments", [])
+                return data.get("repeats", [])
             except json.JSONDecodeError:
                 pass
 
         log.warning(f"Не удалось распарсить ответ LLM:\n{text[:500]}")
         return []
 
-    def _apply_decisions(self, segments: List[Dict], decisions: List[Dict]) -> List[Dict]:
-        decision_map = {
-            item["index"]: item
-            for item in decisions
-            if isinstance(item, dict) and "index" in item
-        }
+    def _apply_decisions(self, segments: List[Dict], repeats: List[Dict]) -> List[Dict]:
+        # По умолчанию все сегменты остаются
+        delete_indices: set = set()
+
+        for repeat in repeats:
+            if not isinstance(repeat, dict):
+                continue
+            delete = repeat.get("delete", [])
+            reason = str(repeat.get("reason", ""))
+            if isinstance(delete, int):
+                delete = [delete]
+            for idx in delete:
+                if isinstance(idx, int) and 0 <= idx < len(segments):
+                    delete_indices.add(idx)
+                    log.info(f"  [{idx}] удалён: {reason}")
 
         result = []
         for i, seg in enumerate(segments):
             seg_copy = dict(seg)
-            llm_data = decision_map.get(i, {})
-            raw_keep = llm_data.get("keep", None)
-            seg_copy["keep"]   = bool(raw_keep) if raw_keep is not None else True
-            seg_copy["reason"] = str(llm_data.get("reason", ""))
+            seg_copy["keep"]   = i not in delete_indices
+            seg_copy["reason"] = ""
             result.append(seg_copy)
 
         return result
