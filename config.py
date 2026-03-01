@@ -63,9 +63,6 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 # Хорошие варианты: "anthropic/claude-3-5-haiku", "google/gemini-2.0-flash-001", "openai/gpt-4o-mini"
 LLM_MODEL = "anthropic/claude-sonnet-4-6"
 
-# Лимит токенов на один запрос к LLM (только при принудительном чанкинге)
-LLM_CHUNK_SIZE_TOKENS = 80000  # Claude Haiku — 200K контекст, большой лимит
-
 # Контекст видео — описание того, ЧТО снимается. LLM использует это для понимания структуры.
 VIDEO_CONTEXT = (
     "Автор записывает процесс дизайна: сначала создаёт карточку товара (Figma/Photoshop), "

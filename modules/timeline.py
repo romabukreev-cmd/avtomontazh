@@ -63,13 +63,12 @@ class TimelineBuilder:
         Возвращает 1+ отрезков {start, end}.
         """
         words = seg.get("words", [])
-        score = seg.get("score", 0.5)
         buf   = config.PAUSE_BUFFER_SEC
         thr   = config.PAUSE_CUT_SEC
 
         if not words:
             # Нет пословных таймстемпов — берём сегмент целиком
-            return [{"start": seg["start"], "end": seg["end"], "score": score}]
+            return [{"start": seg["start"], "end": seg["end"]}]
 
         cuts      = []
         cut_start = max(0.0, words[0]["start"] - buf)
@@ -79,11 +78,11 @@ class TimelineBuilder:
             gap = word["start"] - prev_end
             if gap > thr:
                 # Закрываем текущий отрезок с буфером
-                cuts.append({"start": cut_start, "end": prev_end + buf, "score": score})
+                cuts.append({"start": cut_start, "end": prev_end + buf})
                 # Начинаем новый отрезок с буфером
                 cut_start = max(0.0, word["start"] - buf)
             prev_end = word["end"]
 
         # Закрываем последний отрезок
-        cuts.append({"start": cut_start, "end": prev_end + buf, "score": score})
+        cuts.append({"start": cut_start, "end": prev_end + buf})
         return cuts

@@ -48,7 +48,7 @@ reason — одна фраза почему это повтор.
 
 
 def _build_user_prompt(segments: List[Dict]) -> str:
-    lines = [f"Проанализируй эту транскрипцию:\n"]
+    lines = ["Проанализируй эту транскрипцию:\n"]
     for i, seg in enumerate(segments):
         start = _fmt_time(seg["start"])
         end   = _fmt_time(seg["end"])
