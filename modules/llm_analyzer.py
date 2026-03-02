@@ -1,15 +1,15 @@
 """
-llm_analyzer.py — анализ транскрипции через LLM (OpenRouter API).
+llm_analyzer.py — анализ речевых блоков через LLM (OpenRouter API).
 
-Один проход: отправляем всю транскрипцию в Claude, он маркирует каждый сегмент
-keep=true/false. Убирает повторы и незаконченные дубли.
+Получает блоки из timeline.build_blocks(), находит смысловые повторы,
+возвращает блоки с полем keep=True/False.
 """
 
 import json
 import logging
 import re
 import time
-from typing import Dict, List
+from typing import Dict, List, Set
 
 import httpx
 
@@ -17,11 +17,8 @@ import config
 
 log = logging.getLogger(__name__)
 
-
-# ── Промпты ───────────────────────────────────────────────────────────────────
-
-def _build_system_prompt() -> str:
-    return """Ты редактор видео-транскрипций. Твоя задача — найти все места где автор повторяет одну и ту же мысль несколько раз подряд, и оставить только финальную попытку.
+_SYSTEM_PROMPT = """\
+Ты редактор видео-транскрипций. Твоя задача — найти все места где автор повторяет одну и ту же мысль несколько раз подряд, и оставить только финальную попытку.
 
 Важно: Повторы могут быть как внутри одного временного блока, так и на стыке нескольких блоков подряд. Анализируй весь текст целиком, не блоками.
 
@@ -39,60 +36,38 @@ def _build_system_prompt() -> str:
 - Автор объясняет зачем он что-то делает
 
 Формат ответа — строго JSON, без пояснений до и после:
-{"repeats": [{"delete": [0, 1], "keep": 2, "reason": "почему это повтор"}]}
+{"delete": [0, 3, 5]}
 
-delete — список индексов сегментов которые удалить.
-keep — индекс сегмента который оставить.
-reason — одна фраза почему это повтор.
-Если повторов нет — верни {"repeats": []}"""
+Числа — индексы блоков для удаления (являются повторами или запинками).
+Если удалять нечего — верни {"delete": []}\
+"""
 
-
-def _build_user_prompt(segments: List[Dict]) -> str:
-    lines = ["Проанализируй эту транскрипцию:\n"]
-    for i, seg in enumerate(segments):
-        start = _fmt_time(seg["start"])
-        end   = _fmt_time(seg["end"])
-        text  = seg.get("text", "").strip() or "[тишина]"
-        lines.append(f"[{i}] {start}–{end}  {text}")
-        if i < len(segments) - 1:
-            pause = segments[i + 1]["start"] - seg["end"]
-            if pause >= 3:
-                lines.append(f"    ═══ пауза {pause:.0f}с ═══")
-
-    return "\n".join(lines)
-
-
-# ── Основной класс ────────────────────────────────────────────────────────────
 
 class LLMAnalyzer:
 
-    def analyze(self, segments: List[Dict]) -> List[Dict]:
+    def analyze(self, blocks: List[Dict]) -> List[Dict]:
         """
-        Отправляет всю транскрипцию в Claude одним запросом.
+        Анализирует речевые блоки, маркирует повторы как keep=False.
 
-        Перед отправкой дробит Whisper-сегменты на мелкие фразы по паузам >= PHRASE_SPLIT_SEC.
-        Это даёт LLM возможность удалять повторы внутри одного Whisper-сегмента.
-
-        Возвращает фразы с полем keep=True/False.
+        Args:
+            blocks: список блоков из timeline.build_blocks()
+        Returns:
+            те же блоки с полем keep=True/False
         """
-        if not segments:
+        if not blocks:
             return []
 
-        phrases = self._split_to_phrases(segments)
-        total_duration = sum(s["end"] - s["start"] for s in phrases)
-        log.info(f"LLM анализ: {len(phrases)} фраз (из {len(segments)} сег.), {total_duration/60:.1f} мин")
-
-        system = _build_system_prompt()
-        user   = _build_user_prompt(phrases)
+        user_prompt = self._format_transcript(blocks)
+        log.info(f"LLM анализ: {len(blocks)} блоков")
 
         last_error = None
         for attempt in range(config.LLM_MAX_RETRIES):
             try:
-                raw     = self._call_api(system, user)
-                repeats = self._parse_response(raw)
-                result  = self._apply_decisions(phrases, repeats)
-                kept = sum(1 for s in result if s.get("keep"))
-                log.info(f"LLM итого: оставлено {kept}/{len(result)} фраз")
+                raw = self._call_api(_SYSTEM_PROMPT, user_prompt)
+                delete_set = self._parse_response(raw, len(blocks))
+                result = self._apply_decisions(blocks, delete_set)
+                kept = sum(1 for b in result if b["keep"])
+                log.info(f"LLM: оставлено {kept}/{len(result)}, удалено {len(delete_set)}")
                 return result
             except Exception as e:
                 last_error = e
@@ -100,66 +75,40 @@ class LLMAnalyzer:
                 log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES}: {e}. Жду {wait}с...")
                 time.sleep(wait)
 
-        log.error(f"⚠️ LLM не ответил после {config.LLM_MAX_RETRIES} попыток: {last_error}. Оставляю все фразы.")
-        return self._apply_decisions(phrases, [])  # все keep=True
+        log.error(f"LLM не ответил: {last_error}. Оставляю все блоки.")
+        return self._apply_decisions(blocks, set())
 
-    # ── Дробление на фразы ────────────────────────────────────────────────────
+    # ── Форматирование транскрипции ────────────────────────────────────────────
 
-    def _split_to_phrases(self, segments: List[Dict]) -> List[Dict]:
-        """
-        Дробит Whisper-сегменты на мелкие фразы по паузам >= PHRASE_SPLIT_SEC.
-        Каждый Whisper-сегмент обрабатывается независимо (межсегментные паузы тоже разделяют).
-        Возвращает пронумерованный список фраз с пословными timestamps.
-        """
-        phrases = []
-        for seg in segments:
-            words = seg.get("words", [])
-            if not words:
-                # Нет пословных timestamps — берём сегмент целиком как одну фразу
-                phrases.append({
-                    "start": seg["start"], "end": seg["end"],
-                    "text": seg.get("text", ""), "words": [],
-                })
-                continue
+    def _format_transcript(self, blocks: List[Dict]) -> str:
+        lines = [
+            f"Контекст видео: {config.VIDEO_CONTEXT}",
+            "",
+            "Проанализируй эту транскрипцию:",
+            "",
+        ]
+        for b in blocks:
+            start = _fmt_time(b["start"])
+            end   = _fmt_time(b["end"])
+            text  = b.get("text", "").strip() or "[без текста]"
+            lines.append(f"[{b['index']}] {start} → {end}")
+            lines.append(text)
+            lines.append("")
+        return "\n".join(lines)
 
-            current = [words[0]]
-            for word in words[1:]:
-                gap = word["start"] - current[-1]["end"]
-                if gap >= config.PHRASE_SPLIT_SEC:
-                    phrases.append(self._words_to_phrase(current))
-                    current = [word]
-                else:
-                    current.append(word)
-            phrases.append(self._words_to_phrase(current))
-
-        # Нумеруем фразы для LLM (index = позиция в списке)
-        for i, p in enumerate(phrases):
-            p["index"] = i
-
-        log.info(f"Фраз после дробления: {len(phrases)} (порог: {config.PHRASE_SPLIT_SEC}с)")
-        return phrases
-
-    def _words_to_phrase(self, words: List[Dict]) -> Dict:
-        return {
-            "start": words[0]["start"],
-            "end":   words[-1]["end"],
-            "text":  " ".join(w["word"] for w in words).strip(),
-            "words": words,
-        }
-
-    # ── API ───────────────────────────────────────────────────────────────────
+    # ── API ────────────────────────────────────────────────────────────────────
 
     def _call_api(self, system: str, user: str) -> str:
         response = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/automontazh",
+                "Content-Type":  "application/json",
+                "HTTP-Referer":  "https://github.com/automontazh",
             },
             json={
-                "model": config.LLM_MODEL,
-                "messages": [
+                "model":       config.LLM_MODEL,
+                "messages":    [
                     {"role": "system", "content": system},
                     {"role": "user",   "content": user},
                 ],
@@ -170,59 +119,56 @@ class LLMAnalyzer:
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
 
-    # ── Парсинг ───────────────────────────────────────────────────────────────
+    # ── Парсинг ────────────────────────────────────────────────────────────────
 
-    def _parse_response(self, text: str) -> List[Dict]:
-        text = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.IGNORECASE)
-        text = re.sub(r'\s*```\s*$', '', text)
+    def _parse_response(self, text: str, total_blocks: int) -> Set[int]:
+        # Убираем markdown-обёртку если модель добавила
+        text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
+        text = re.sub(r"\s*```\s*$", "", text)
 
+        data = None
         try:
             data = json.loads(text)
-            if isinstance(data, dict) and "repeats" in data:
-                return data["repeats"]
         except json.JSONDecodeError:
-            pass
+            match = re.search(r'\{"delete"\s*:\s*\[[^\]]*\]\s*\}', text, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
 
-        match = re.search(r'\{.*"repeats"\s*:\s*\[.*\]\s*\}', text, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group())
-                return data.get("repeats", [])
-            except json.JSONDecodeError:
-                pass
+        if data is None:
+            log.warning(f"Не удалось распарсить ответ LLM:\n{text[:500]}")
+            return set()
 
-        log.warning(f"Не удалось распарсить ответ LLM:\n{text[:500]}")
-        return []
+        delete_list = data.get("delete", [])
+        if not isinstance(delete_list, list):
+            return set()
 
-    def _apply_decisions(self, segments: List[Dict], repeats: List[Dict]) -> List[Dict]:
-        # По умолчанию все сегменты остаются
-        delete_indices: set = set()
+        valid = set()
+        for idx in delete_list:
+            if isinstance(idx, int) and 0 <= idx < total_blocks:
+                valid.add(idx)
+            else:
+                log.warning(f"Некорректный индекс от LLM: {idx!r}")
+        return valid
 
-        for repeat in repeats:
-            if not isinstance(repeat, dict):
-                continue
-            delete = repeat.get("delete", [])
-            reason = str(repeat.get("reason", ""))
-            if isinstance(delete, int):
-                delete = [delete]
-            for idx in delete:
-                if isinstance(idx, int) and 0 <= idx < len(segments):
-                    delete_indices.add(idx)
-                    log.info(f"  [{idx}] удалён: {reason}")
+    # ── Применение решений ─────────────────────────────────────────────────────
 
+    def _apply_decisions(self, blocks: List[Dict], delete_set: Set[int]) -> List[Dict]:
         result = []
-        for i, seg in enumerate(segments):
-            seg_copy = dict(seg)
-            seg_copy["keep"]   = i not in delete_indices
-            seg_copy["reason"] = ""
-            result.append(seg_copy)
-
+        for b in blocks:
+            b_copy = dict(b)
+            b_copy["keep"] = b["index"] not in delete_set
+            if not b_copy["keep"]:
+                log.info(f"  [{b['index']}] удалён: {b.get('text', '')[:70]!r}")
+            result.append(b_copy)
         return result
 
 
-# ── Утилита ───────────────────────────────────────────────────────────────────
+# ── Утилита ────────────────────────────────────────────────────────────────────
 
 def _fmt_time(seconds: float) -> str:
     m = int(seconds // 60)
-    s = int(seconds % 60)
-    return f"{m}:{s:02d}"
+    s = seconds % 60
+    return f"{m}:{s:05.2f}"

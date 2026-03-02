@@ -1,38 +1,12 @@
 """
-renderer.py — сборка финальных видео через FFmpeg.
+renderer.py — сборка финального видео через FFmpeg.
 
-Как работает нарезка без промежуточных файлов:
-  FFmpeg умеет принимать список отрезков через «concat demuxer»:
-    1. Создаём временный текстовый файл (concat list):
-         file '/path/to/source.mp4'
-         inpoint 0.0
-         outpoint 12.4
-         file '/path/to/source.mp4'
-         inpoint 14.1
-         outpoint 28.7
-         ...
-    2. FFmpeg читает этот список и склеивает отрезки в один поток
-    3. Поверх применяем фильтры (кроп, масштаб, наложение вебки)
+Нарезка выполняется через concat demuxer:
+  1. Создаём список отрезков (inpoint/outpoint) для каждого kept-блока
+  2. FFmpeg читает список и склеивает отрезки в один поток
+  3. Поверх применяем filtergraph (кроп, масштаб, vstack)
 
-Для каждого формата своя цепочка FFmpeg-фильтров (filtergraph):
-
-─── Формат 1 и 2 (вертикальный split-screen 1080×1920) ──────────────────────
-
-  [screen]  → crop центр до 9:8 (1215×1080) → scale 1080×960  → [top]
-  [webcam]  → crop центр до 9:8 (1215×1080) → scale 1080×960  → [bottom]
-  [top][bottom] → vstack → [out]  (1080×1920)
-
-  FFmpeg filtergraph:
-    [0:v]crop=1215:1080:352:0,scale=1080:960[top];
-    [1:v]crop=1215:1080:352:0,scale=1080:960[bot];
-    [top][bot]vstack[out]
-
-─── Формат 3 (горизонтальный PiP 1920×1080) ─────────────────────────────────
-
-  [screen]  → crop 1920×1200→1920×1080 → scale 1920×1080 → [bg]
-  [webcam]  → scale 1920×1080 → crop квадрат 1080×1080 → scale PIP×PIP
-            → скруглённые углы через geq (yuva420p alpha-маска) → [pip]
-  [bg][pip] → overlay правый нижний угол → [out]
+Формат 1: вертикальный 1080×1920 (split-screen, экран сверху + вебка снизу).
 """
 
 import logging
@@ -52,7 +26,7 @@ class VideoRenderer:
         self.screen_file  = screen_file
         self.webcam_file  = webcam_file
         self.session_name = session_name
-        self.temp_files: List[Path] = []  # для уборки после обработки
+        self._temp_files: List[Path] = []
 
     def render_vertical(
         self,
@@ -62,34 +36,41 @@ class VideoRenderer:
         progress_callback: Optional[Callable[[float], None]] = None,
     ) -> Path:
         """
-        Рендерит вертикальное видео 1080×1920 (split-screen: экран сверху, вебка снизу).
-        Используется для Формата 1 (10 мин) и Формата 2 (3 мин / хайлайты).
-        """
-        output_file = output_dir / output_filename
+        Рендерит вертикальное видео 1080×1920 (экран сверху, вебка снизу).
 
+        timeline — список блоков с полями start и end.
+        """
+        if not timeline:
+            raise ValueError("Пустой таймлайн — нечего рендерить")
+
+        output_file = output_dir / output_filename
         screen_list = self._write_concat_list(self.screen_file, timeline, "screen")
         webcam_list = self._write_concat_list(self.webcam_file, timeline, "webcam")
 
-        # Filtergraph: два потока → кроп центра → vstack
         # Экран может быть 1920×1200 — кропаем по Y чтобы получить 1920×1080
-        # Вебка нормализуется до 1920×1080 на случай нестандартного разрешения/SAR
         cy = config.SCREEN_CROP_Y  # 60 для 1920×1200, 0 для 1920×1080
+
+        # Filtergraph:
+        #   [0:v] экран  → crop центр 1215×1080 → scale 1080×960 → [top]
+        #   [1:v] вебка  → нормализуем → crop центр 1215×1080 → scale 1080×960 → [bot]
+        #   [top][bot]   → vstack → [vout]
+        #   [0:a]        → afade in/out → [aout]
+        total = sum(s["end"] - s["start"] for s in timeline)
+        fade_out_start = max(0.0, total - 0.5)
+
         filtergraph = (
             f"[0:v]crop=1215:1080:352:{cy},scale=1080:960[top];"
             "[1:v]scale=1920:1080:flags=lanczos,setsar=1,crop=1215:1080:352:0,scale=1080:960[bot];"
-            "[top][bot]vstack[out]"
+            "[top][bot]vstack[vout];"
+            f"[0:a]afade=t=in:st=0:d=0.5,afade=t=out:st={fade_out_start:.3f}:d=0.5[aout]"
         )
 
-        audio_fade = self._build_audio_fade_filter(timeline)
-        filtergraph += f";[0:a]{audio_fade}[aout]"
-
-        total_duration = sum(s["end"] - s["start"] for s in timeline)
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", str(screen_list),
             "-f", "concat", "-safe", "0", "-i", str(webcam_list),
             "-filter_complex", filtergraph,
-            "-map", "[out]",
+            "-map", "[vout]",
             "-map", "[aout]",
             "-c:v", config.VIDEO_CODEC,
             "-crf", str(config.VIDEO_CRF),
@@ -100,99 +81,14 @@ class VideoRenderer:
             str(output_file),
         ]
 
-        log.info(f"Рендер vertical → {output_filename}")
-        self._run_ffmpeg(cmd, total_duration, progress_callback)
-        return output_file
-
-    def render_horizontal(
-        self,
-        timeline: List[Dict],
-        output_dir: Path,
-        output_filename: str,
-        progress_callback: Optional[Callable[[float], None]] = None,
-    ) -> Path:
-        """
-        Рендерит горизонтальное видео 1920×1080 (полный экран + вебка-кружок PiP).
-        Формат 3.
-        """
-        output_file = output_dir / output_filename
-
-        screen_list = self._write_concat_list(self.screen_file, timeline, "screen_h")
-        webcam_list = self._write_concat_list(self.webcam_file, timeline, "webcam_h")
-
-        # Позиция PiP-окошка (правый нижний угол с отступами)
-        pip_x = config.FORMAT_3["width"]  - config.PIP_WIDTH  - config.PIP_MARGIN_RIGHT
-        pip_y = config.FORMAT_3["height"] - config.PIP_HEIGHT - config.PIP_MARGIN_BOTTOM
-
-        # Filtergraph:
-        #   [0:v] экран → scale 1920×1080 → [bg]
-        #   [1:v] вебка → crop квадрат из центра (1080×1080 из 1920×1080)
-        #               → scale до PIP_WIDTH×PIP_HEIGHT
-        #               → скруглённые углы через geq
-        #               → [pip]
-        #   [bg][pip] → overlay в правый нижний угол
-        r  = config.PIP_CORNER_RADIUS
-        s  = config.PIP_WIDTH
-        cy = config.SCREEN_CROP_Y        # кроп экрана по вертикали
-        cx = (1920 - 1080) // 2          # = 420, кроп вебки по горизонтали
-
-        # Правильная формула скруглённых углов (CSS border-radius):
-        # Делаем ПРОЗРАЧНЫМИ только угловые зоны за пределами окружности,
-        # всё остальное остаётся видимым.
-        geq_alpha = (
-            f"a='if("
-            f"(lt(X,{r})*lt(Y,{r})*gt(hypot(X-{r},Y-{r}),{r}))+"
-            f"(gt(X,{s}-{r}-1)*lt(Y,{r})*gt(hypot(X-({s}-{r}),Y-{r}),{r}))+"
-            f"(lt(X,{r})*gt(Y,{s}-{r}-1)*gt(hypot(X-{r},Y-({s}-{r})),{r}))+"
-            f"(gt(X,{s}-{r}-1)*gt(Y,{s}-{r}-1)*gt(hypot(X-({s}-{r}),Y-({s}-{r})),{r})),"
-            f"0,255)'"
-        )
-
-        filtergraph = (
-            # Экран: сначала кропаем 1920×1200 → 1920×1080, потом масштабируем
-            f"[0:v]crop={config.FORMAT_3['width']}:1080:0:{cy},"
-            f"scale={config.FORMAT_3['width']}:{config.FORMAT_3['height']}[bg];"
-            # Вебка: нормализуем до 1920×1080, кропаем центральный квадрат 1080×1080
-            f"[1:v]scale=1920:1080:flags=lanczos,setsar=1,"
-            f"crop=1080:1080:{cx}:0,scale={s}:{s},format=yuva420p,"
-            f"geq=lum='p(X,Y)':{geq_alpha}[pip];"
-            f"[bg][pip]overlay={pip_x}:{pip_y}[out]"
-        )
-
-        audio_fade = self._build_audio_fade_filter(timeline)
-        filtergraph += f";[0:a]{audio_fade}[aout]"
-
-        total_duration = sum(s["end"] - s["start"] for s in timeline)
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(screen_list),
-            "-f", "concat", "-safe", "0", "-i", str(webcam_list),
-            "-filter_complex", filtergraph,
-            "-map", "[out]",
-            "-map", "[aout]",
-            "-c:v", config.VIDEO_CODEC,
-            "-crf", str(config.VIDEO_CRF),
-            "-preset", config.VIDEO_PRESET,
-            "-c:a", config.AUDIO_CODEC,
-            "-b:a", config.AUDIO_BITRATE,
-            "-threads", str(config.FFMPEG_THREADS),
-            str(output_file),
-        ]
-
-        log.info(f"Рендер horizontal → {output_filename}")
-        self._run_ffmpeg(cmd, total_duration, progress_callback)
+        log.info(f"Рендер: {output_filename} ({len(timeline)} блоков, {total:.1f}с)")
+        self._run_ffmpeg(cmd, total, progress_callback)
         return output_file
 
     # ── Вспомогательные методы ────────────────────────────────────────────────
 
     def _write_concat_list(self, source_file: Path, timeline: List[Dict], tag: str) -> Path:
-        """
-        Создаёт временный .txt файл со списком отрезков для FFmpeg concat demuxer.
-        Формат:
-            file '/abs/path/to/video.mp4'
-            inpoint 0.000
-            outpoint 12.400
-        """
+        """Создаёт временный .txt файл со списком inpoint/outpoint для FFmpeg concat."""
         config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
         list_path = config.TEMP_DIR / f"{self.session_name}_{tag}_list.txt"
 
@@ -203,7 +99,7 @@ class VideoRenderer:
                 f.write(f"inpoint {seg['start']:.3f}\n")
                 f.write(f"outpoint {seg['end']:.3f}\n")
 
-        self.temp_files.append(list_path)
+        self._temp_files.append(list_path)
         return list_path
 
     def _run_ffmpeg(
@@ -212,10 +108,6 @@ class VideoRenderer:
         total_duration: float,
         progress_callback: Optional[Callable[[float], None]],
     ) -> None:
-        """
-        Запускает FFmpeg, парсит прогресс из stderr и вызывает progress_callback(%).
-        Бросает исключение если FFmpeg завершился с ошибкой.
-        """
         process = subprocess.Popen(
             cmd,
             stderr=subprocess.PIPE,
@@ -230,14 +122,11 @@ class VideoRenderer:
 
         for line in process.stderr:
             stderr_lines.append(line)
-
-            # Парсим текущее время из строк вида: time=00:01:23.45
             match = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
             if match and total_duration > 0 and progress_callback:
                 h, m, s = int(match.group(1)), int(match.group(2)), float(match.group(3))
-                current_sec = h * 3600 + m * 60 + s
-                pct = min(current_sec / total_duration * 100, 99)
-                # Вызываем колбэк только при изменении на 5%+ (не спамим)
+                current = h * 3600 + m * 60 + s
+                pct = min(current / total_duration * 100, 99)
                 if pct - last_pct >= 5:
                     last_pct = pct
                     try:
@@ -257,25 +146,8 @@ class VideoRenderer:
             except Exception:
                 pass
 
-        log.debug(f"FFmpeg завершён успешно")
-
-    def _build_audio_fade_filter(self, timeline: List[Dict]) -> str:
-        """
-        Строит afade-фильтры: плавный fade-in в начале и fade-out в конце ролика.
-
-        Примечание: фейды на стыках склейки НЕ применяются, потому что
-        несколько последовательных afade=t=out зануляют аудио навсегда —
-        каждый afade=t=out держит нулевое усиление после своего периода,
-        и последующий afade=t=in не может поднять уже обнулённый сигнал.
-        Concat demuxer обеспечивает точные inpoint/outpoint без артефактов.
-        """
-        d = 0.5  # длительность fade в секундах
-        total = sum(s["end"] - s["start"] for s in timeline)
-        fade_out_start = max(0.0, total - d)
-        return f"afade=t=in:st=0:d={d},afade=t=out:st={fade_out_start:.3f}:d={d}"
-
     def cleanup_temp(self) -> None:
-        """Удаляет все временные файлы, созданные при рендере."""
-        for f in self.temp_files:
+        """Удаляет все временные файлы созданные при рендере."""
+        for f in self._temp_files:
             f.unlink(missing_ok=True)
-        self.temp_files.clear()
+        self._temp_files.clear()

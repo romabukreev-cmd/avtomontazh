@@ -1,18 +1,9 @@
 """
-timeline.py — построение таймлайна из отобранных LLM сегментов.
+timeline.py — разбивает Whisper-слова на речевые блоки по паузам.
 
-Алгоритм:
-  Для каждого kept-сегмента с пословными таймстемпами:
-    1. Сканируем промежутки между словами
-    2. Промежуток > PAUSE_CUT_SEC → разрезаем здесь
-       Оставляем PAUSE_BUFFER_SEC с каждой стороны (не рубим прямо по слову)
-    3. Результат: список отрезков {start, end} для renderer.py
-
-Пример:
-  Слова: [1.0–1.5] "Итак" [1.6–2.0] "нарисуем" ... пауза 1.2с ... [3.4–3.9] "карточку"
-  PAUSE_CUT_SEC=0.6, PAUSE_BUFFER_SEC=0.2:
-    → отрезок 1: start=0.9, end=2.2   (буфер вокруг "нарисуем")
-    → отрезок 2: start=3.2, end=4.1   (буфер вокруг "карточку")
+Блок = непрерывная речь без пауз >= PAUSE_CUT_SEC.
+Паузы между блоками вырезаются автоматически — в финальный таймлайн
+попадают только сами блоки (LLM решает какие оставить, какие удалить).
 """
 
 import logging
@@ -23,79 +14,60 @@ import config
 log = logging.getLogger(__name__)
 
 
-class TimelineBuilder:
+def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
+    """
+    Из Whisper-сегментов строит речевые блоки.
 
-    def build(self, segments: List[Dict]) -> List[Dict]:
-        """
-        Строит таймлайн из kept-сегментов.
-        Внутренние паузы > config.PAUSE_CUT_SEC удаляются с буфером config.PAUSE_BUFFER_SEC.
+    Алгоритм:
+      1. Собираем все слова из всех сегментов в единый поток
+      2. Разбиваем по паузам >= PAUSE_CUT_SEC → речевые блоки
+      3. Каждый блок получает start/end с буфером PAUSE_BUFFER_SEC
 
-        Returns: [{start, end}, ...] для renderer.py
-        """
-        kept = [s for s in segments if s.get("keep", False)]
-        if not kept:
-            log.warning("build: нет ни одного keep=True сегмента")
-            return []
+    Returns:
+        [{"index": 0, "start": 0.3, "end": 5.0, "text": "...", "words": [...]}, ...]
+    """
+    all_words = []
+    for seg in whisper_segments:
+        for w in seg.get("words", []):
+            if w.get("start") is not None and w.get("end") is not None:
+                all_words.append(w)
 
-        kept.sort(key=lambda s: s["start"])
+    if not all_words:
+        return []
 
-        cuts = []
-        for seg in kept:
-            cuts.extend(self._cut_segment(seg))
+    all_words.sort(key=lambda w: w["start"])
 
-        if not cuts:
-            return []
+    buf = config.PAUSE_BUFFER_SEC
+    thr = config.PAUSE_CUT_SEC
 
-        cuts.sort(key=lambda c: c["start"])
+    blocks = []
+    current = [all_words[0]]
 
-        # Сливаем перекрывающиеся срезы.
-        # Перекрытие возникает когда два соседних Whisper-сегмента разделены паузой
-        # меньше 2×PAUSE_BUFFER_SEC (0.4с): буфер одного залезает в буфер другого.
-        merged = [dict(cuts[0])]
-        for cut in cuts[1:]:
-            last = merged[-1]
-            if cut["start"] <= last["end"]:
-                last["end"] = max(last["end"], cut["end"])
-            else:
-                merged.append(dict(cut))
-        cuts = merged
+    for word in all_words[1:]:
+        gap = word["start"] - current[-1]["end"]
+        if gap >= thr:
+            blocks.append(_words_to_block(current, buf))
+            current = [word]
+        else:
+            current.append(word)
+    blocks.append(_words_to_block(current, buf))
 
-        total = self.total_duration(cuts)
-        log.info(f"Таймлайн: {len(cuts)} отрезков, {total:.1f}с")
-        return cuts
+    for i, b in enumerate(blocks):
+        b["index"] = i
 
-    def total_duration(self, timeline: List[Dict]) -> float:
-        return sum(seg["end"] - seg["start"] for seg in timeline)
+    log.info(f"Речевых блоков: {len(blocks)} (порог паузы: {thr}с, буфер: {buf}с)")
+    return blocks
 
-    # ── Нарезка одного сегмента ───────────────────────────────────────────────
 
-    def _cut_segment(self, seg: Dict) -> List[Dict]:
-        """
-        Разрезает один сегмент по паузам > PAUSE_CUT_SEC.
-        Каждая пауза заменяется склейкой с буфером PAUSE_BUFFER_SEC с каждой стороны.
-        Возвращает 1+ отрезков {start, end}.
-        """
-        words = seg.get("words", [])
-        buf   = config.PAUSE_BUFFER_SEC
-        thr   = config.PAUSE_CUT_SEC
+def _words_to_block(words: List[Dict], buf: float) -> Dict:
+    return {
+        "start": max(0.0, words[0]["start"] - buf),
+        "end":   words[-1]["end"] + buf,
+        "text":  " ".join(w["word"] for w in words).strip(),
+        "words": words,
+    }
 
-        if not words:
-            # Нет пословных таймстемпов — берём сегмент целиком
-            return [{"start": seg["start"], "end": seg["end"]}]
 
-        cuts      = []
-        cut_start = max(0.0, words[0]["start"] - buf)
-        prev_end  = words[0]["end"]
-
-        for word in words[1:]:
-            gap = word["start"] - prev_end
-            if gap > thr:
-                # Закрываем текущий отрезок с буфером
-                cuts.append({"start": cut_start, "end": prev_end + buf})
-                # Начинаем новый отрезок с буфером
-                cut_start = max(0.0, word["start"] - buf)
-            prev_end = word["end"]
-
-        # Закрываем последний отрезок
-        cuts.append({"start": cut_start, "end": prev_end + buf})
-        return cuts
+def total_duration(blocks: List[Dict]) -> float:
+    """Суммарная длительность блоков в секундах."""
+    return sum(b["end"] - b["start"] for b in blocks)
