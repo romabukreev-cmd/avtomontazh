@@ -35,6 +35,15 @@ _SYSTEM_PROMPT = """\
 3. ТЕХНИЧЕСКИЕ ПОВТОРЫ — дословное или почти дословное повторение через несколько блоков:
    - Автор случайно начинает ту же фразу что уже сказал
 
+4. ОСКОЛКИ — короткие блоки (1-5 слов) без самостоятельного смысла:
+   - Фрагмент оказался между двумя удалёнными блоками одной темы → он тоже часть неудачной попытки
+   - Пример: удалены "[3] Отправляюсь в синтекс" и "[6] Далее иду в синтекс..." → блок [5] "дизайн с ИИ" между ними — осколок, удалять
+
+5. ОБРЕЗАННЫЕ СЛОВА — блок начинается с суффикса/хвоста слова, а не с начала:
+   - "фовую картинку, которую в целом" — "фовую" не является русским словом, это хвост слова "кайфовую" → обрезанный дубль → удалять
+   - "тся в магазин", "ться нажать" — "тся"/"ться" не слова → удалять
+   - Если первое слово блока не существует как самостоятельное слово в русском языке — удалять весь блок
+
 Что НЕ удалять:
 - Осознанное подведение итогов ("Итак, мы сделали X, теперь делаем Y")
 - Объяснение своих действий ("Нажимаю сюда, потому что...")
@@ -67,6 +76,8 @@ class LLMAnalyzer:
 
         user_prompt = self._format_transcript(blocks)
         log.info(f"LLM анализ: {len(blocks)} блоков")
+        for b in blocks:
+            log.debug(f"  [{b['index']}] {_fmt_time(b['start'])}→{_fmt_time(b['end'])} | {b.get('text','')[:80]}")
 
         last_error = None
         for attempt in range(config.LLM_MAX_RETRIES):
@@ -164,6 +175,9 @@ class LLMAnalyzer:
     # ── Применение решений ─────────────────────────────────────────────────────
 
     def _apply_decisions(self, blocks: List[Dict], delete_set: Set[int]) -> List[Dict]:
+        # Второй проход: авто-удаление коротких осколков между удалёнными блоками
+        delete_set = self._cleanup_orphan_fragments(blocks, delete_set)
+
         result = []
         for b in blocks:
             b_copy = dict(b)
@@ -171,6 +185,41 @@ class LLMAnalyzer:
             if not b_copy["keep"]:
                 log.info(f"  [{b['index']}] удалён: {b.get('text', '')[:70]!r}")
             result.append(b_copy)
+        return result
+
+    def _cleanup_orphan_fragments(self, blocks: List[Dict], delete_set: Set[int]) -> Set[int]:
+        """
+        Авто-удаляет короткие осколки: блоки, у которых оба соседа (idx-1 и idx+1)
+        уже удалены LLM, а сам блок короткий (≤5 слов или <2.5с).
+
+        Ловит ситуацию: LLM удалил [3] и [6], но пропустил [5] "дизайн с ИИ" между ними.
+        """
+        result = set(delete_set)
+        index_set = {b["index"] for b in blocks}
+
+        for b in blocks:
+            idx = b["index"]
+            if idx in result:
+                continue
+
+            prev_idx = idx - 1
+            next_idx = idx + 1
+
+            # Нужны оба соседа в списке блоков
+            if prev_idx not in index_set or next_idx not in index_set:
+                continue
+
+            # Оба соседа удалены
+            if prev_idx not in result or next_idx not in result:
+                continue
+
+            # Короткий блок — осколок
+            word_count = len(b.get("text", "").split())
+            duration = b["end"] - b["start"]
+            if word_count <= 5 or duration < 2.5:
+                result.add(idx)
+                log.info(f"  [{idx}] авто-удалён (осколок): {b.get('text', '')[:60]!r}")
+
         return result
 
 
