@@ -6,13 +6,15 @@ transcriber.py — транскрипция аудио через Whisper.
   2. Whisper транскрибирует с word_timestamps=True и vad_filter=True
   3. Возвращает сегменты Whisper с пословными таймстемпами
 
-Паузы удаляются позже — в timeline.py, уже после LLM-анализа.
+Модель загружается лениво: только когда приходит задача, и выгружается
+сразу после завершения транскрипции, чтобы не занимать RAM постоянно.
 """
 
+import gc
 import logging
 import subprocess
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from faster_whisper import WhisperModel
 
@@ -24,13 +26,8 @@ log = logging.getLogger(__name__)
 class Transcriber:
 
     def __init__(self):
-        log.info(f"Загрузка Whisper модели '{config.WHISPER_MODEL}'...")
-        self._model = WhisperModel(
-            config.WHISPER_MODEL,
-            device="cpu",
-            compute_type="int8",  # int8 квантизация: +30% скорость, качество не страдает
-        )
-        log.info("Whisper готов")
+        self._model: Optional[WhisperModel] = None
+        log.info(f"Transcriber создан (модель '{config.WHISPER_MODEL}' загружается по требованию)")
 
     def transcribe(self, video_file: Path) -> List[Dict]:
         """
@@ -49,9 +46,11 @@ class Transcriber:
         """
         audio_file = self._extract_audio(video_file)
         try:
+            self._load_model()
             segments = self._transcribe_segments(audio_file)
         finally:
             audio_file.unlink(missing_ok=True)
+            self._unload_model()
 
         log.info(f"Итого сегментов: {len(segments)}")
         return segments
@@ -81,7 +80,29 @@ class Transcriber:
 
         return audio_path
 
-    # ── Шаг 2: Транскрипция ───────────────────────────────────────────────────
+    # ── Шаг 2: Загрузка / выгрузка модели ────────────────────────────────────
+
+    def _load_model(self) -> None:
+        if self._model is not None:
+            return
+        log.info(f"Загрузка Whisper '{config.WHISPER_MODEL}'...")
+        self._model = WhisperModel(
+            config.WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8",  # int8 квантизация: +30% скорость, качество не страдает
+        )
+        log.info("Whisper загружен")
+
+    def _unload_model(self) -> None:
+        if self._model is None:
+            return
+        log.info("Выгрузка Whisper из памяти...")
+        del self._model
+        self._model = None
+        gc.collect()
+        log.info("Whisper выгружен")
+
+    # ── Шаг 3: Транскрипция ───────────────────────────────────────────────────
 
     def _transcribe_segments(self, audio_file: Path) -> List[Dict]:
         """

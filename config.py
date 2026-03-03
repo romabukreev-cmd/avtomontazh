@@ -31,7 +31,7 @@ VIDEO_EXTENSIONS    = {".mp4", ".mkv", ".avi", ".mov", ".ts"}
 # ─── Whisper (транскрипция) ───────────────────────────────────────────────────
 
 # Модель: tiny/base/small/medium/large-v3
-WHISPER_MODEL    = "medium"
+WHISPER_MODEL    = "large-v3"
 WHISPER_LANGUAGE = "ru"
 
 # ─── Нарезка пауз (применяется после LLM-анализа) ────────────────────────────
