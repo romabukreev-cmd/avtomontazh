@@ -91,6 +91,8 @@ class Transcriber:
             config.WHISPER_MODEL,
             device="cpu",
             compute_type="int8",  # int8 квантизация: +30% скорость, качество не страдает
+            cpu_threads=2,        # оставляем 2 ядра другим процессам (syntx, OS)
+            num_workers=1,        # один поток декодирования — меньше пик памяти
         )
         log.info("Whisper загружен")
 
