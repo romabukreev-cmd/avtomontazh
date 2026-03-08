@@ -24,12 +24,19 @@ import subprocess
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 import config
@@ -37,6 +44,24 @@ from modules.session_manager import Session, SessionManager
 from modules.utils import format_duration
 
 log = logging.getLogger(__name__)
+
+_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton("📥 Sync"),     KeyboardButton("📋 Сессии"), KeyboardButton("📊 Статус")],
+        [KeyboardButton("⛔ Отмена"),   KeyboardButton("🔄 Сброс")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+# Текст кнопки → имя команды-обработчика
+_BUTTON_COMMANDS = {
+    "📥 sync":      "_cmd_sync",
+    "📋 сессии":    "_cmd_sessions",
+    "📊 статус":    "_cmd_status",
+    "⛔ отмена":    "_cmd_cancel",
+    "🔄 сброс":     "_cmd_reset",
+}
 
 
 class AutomontazhBot:
@@ -87,6 +112,9 @@ class AutomontazhBot:
         app.add_handler(CallbackQueryHandler(self._on_session_selected, pattern="^process:"))
         app.add_handler(CallbackQueryHandler(self._on_reset_selected,   pattern="^reset:"))
 
+        # Обработчик кнопок постоянной клавиатуры
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_keyboard_button))
+
         log.info("Telegram-бот запущен. Жду команды...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
@@ -96,18 +124,24 @@ class AutomontazhBot:
         if not self._is_allowed(update):
             return
 
-        text = (
-            "Привет! Я Автомонтаж — система автоматического монтажа видео.\n\n"
-            "Команды:\n"
-            "/sync — скачать новые файлы с Google Drive\n"
-            "/sessions — показать сессии для обработки (можно добавить в очередь)\n"
-            "/status — статус обработки и очередь\n"
-            "/cancel — остановить текущую обработку и очистить очередь\n"
-            "/reset — сбросить незавершённую сессию (удалить частичный output)\n\n"
-            "Очередь: выбирай несколько сессий через /sessions — они обработаются автоматически по очереди.\n\n"
-            "Перед первым запуском выполни /sync чтобы скачать файлы."
+        await update.message.reply_text(
+            "Привет! Я Автомонтаж.\n\nИспользуй кнопки ниже или команды:\n"
+            "/sync — скачать файлы с Google Drive\n"
+            "/sessions — сессии для обработки\n"
+            "/status — статус и очередь\n"
+            "/cancel — остановить обработку\n"
+            "/reset — сбросить незавершённую сессию",
+            reply_markup=_KEYBOARD,
         )
-        await update.message.reply_text(text)
+
+    async def _on_keyboard_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обрабатывает нажатия на кнопки постоянной клавиатуры."""
+        if not self._is_allowed(update):
+            return
+        text = (update.message.text or "").lower()
+        method_name = _BUTTON_COMMANDS.get(text)
+        if method_name:
+            await getattr(self, method_name)(update, ctx)
 
     async def _cmd_sync(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_allowed(update):
