@@ -24,7 +24,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -55,11 +55,22 @@ class AutomontazhBot:
 
     # ── Запуск бота ───────────────────────────────────────────────────────────
 
+    async def _post_init(self, app: Application) -> None:
+        """Регистрирует команды в меню Telegram (кнопка "/" у поля ввода)."""
+        await app.bot.set_my_commands([
+            BotCommand("sync",     "скачать файлы с Google Drive"),
+            BotCommand("sessions", "показать сессии для обработки"),
+            BotCommand("status",   "статус обработки и очередь"),
+            BotCommand("cancel",   "остановить обработку"),
+            BotCommand("reset",    "сбросить незавершённую сессию"),
+        ])
+
     def run(self) -> None:
         """Запускает бота в режиме polling. Блокирует до Ctrl+C."""
         app = (
             Application.builder()
             .token(config.TELEGRAM_BOT_TOKEN)
+            .post_init(self._post_init)
             .build()
         )
         self._app = app  # сохраняем для отправки сообщений из очереди
