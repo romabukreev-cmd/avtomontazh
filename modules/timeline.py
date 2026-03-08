@@ -1,15 +1,15 @@
 """
-timeline.py — разбивает Whisper-слова на речевые блоки по паузам.
+timeline.py — конвертирует Whisper-сегменты в речевые блоки.
 
-Блок = непрерывная речь без пауз >= PAUSE_CUT_SEC.
-Паузы между блоками вырезаются автоматически — в финальный таймлайн
-попадают только сами блоки (LLM решает какие оставить, какие удалить).
+Каждый сегмент от Whisper = один блок. Границы сегментов определяются Silero VAD
+(min_silence_duration_ms=VAD_MIN_SILENCE_MS), поэтому start/end надёжны и отражают
+реальные паузы в аудио — независимо от точности Whisper word-timestamps.
+
+Word-gap сплиттинг больше не нужен.
 """
 
 import logging
 from typing import Dict, List
-
-import config
 
 log = logging.getLogger(__name__)
 
@@ -18,63 +18,28 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
     """
     Из Whisper-сегментов строит речевые блоки.
 
-    Алгоритм:
-      1. Собираем все слова из всех сегментов в единый поток
-      2. Разбиваем по паузам >= PAUSE_CUT_SEC → речевые блоки
-      3. Каждый блок получает start/end с буфером PAUSE_BUFFER_SEC
+    Каждый сегмент → блок с теми же start/end (уже надёжные — из Silero VAD).
+    Пустые сегменты пропускаются.
 
     Returns:
         [{"index": 0, "start": 0.3, "end": 5.0, "text": "...", "words": [...]}, ...]
     """
-    all_words = []
-    for seg in whisper_segments:
-        for w in seg.get("words", []):
-            if w.get("start") is not None and w.get("end") is not None:
-                all_words.append(w)
-
-    if not all_words:
-        return []
-
-    all_words.sort(key=lambda w: w["start"])
-
-    buf = config.PAUSE_BUFFER_SEC
-    thr = config.PAUSE_CUT_SEC
-
     blocks = []
-    current = [all_words[0]]
+    for seg in whisper_segments:
+        text  = seg.get("text", "").strip()
+        words = seg.get("words", [])
+        if not text and not words:
+            continue
+        blocks.append({
+            "index": len(blocks),
+            "start": seg["start"],
+            "end":   seg["end"],
+            "text":  text,
+            "words": words,
+        })
 
-    for word in all_words[1:]:
-        # Используем кэпнутый end — иначе раздутый Whisper-таймстемп скрывает реальную паузу
-        last_end = min(current[-1]["end"], current[-1]["start"] + _MAX_WORD_DURATION)
-        gap = word["start"] - last_end
-        if gap >= thr:
-            blocks.append(_words_to_block(current, buf))
-            current = [word]
-        else:
-            current.append(word)
-    blocks.append(_words_to_block(current, buf))
-
-    for i, b in enumerate(blocks):
-        b["index"] = i
-
-    log.info(f"Речевых блоков: {len(blocks)} (порог паузы: {thr}с, буфер: {buf}с)")
+    log.info(f"Речевых блоков: {len(blocks)}")
     return blocks
-
-
-_MAX_WORD_DURATION = 1.5  # сек: cap на длину слова — защита от плохих Whisper-таймстемпов
-
-
-def _words_to_block(words: List[Dict], buf: float) -> Dict:
-    # Whisper иногда выставляет word.end слишком далеко (особенно для последнего слова
-    # в сегменте). Ограничиваем: слово не может длиться дольше _MAX_WORD_DURATION.
-    last = words[-1]
-    capped_end = min(last["end"], last["start"] + _MAX_WORD_DURATION)
-    return {
-        "start": max(0.0, words[0]["start"] - buf),
-        "end":   capped_end + buf,
-        "text":  " ".join(w["word"] for w in words).strip(),
-        "words": words,
-    }
 
 
 def total_duration(blocks: List[Dict]) -> float:

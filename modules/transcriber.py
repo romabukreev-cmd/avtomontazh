@@ -121,6 +121,10 @@ class Transcriber:
             language=config.WHISPER_LANGUAGE,
             word_timestamps=True,
             vad_filter=True,                      # Silero VAD: только реальная речь
+            vad_parameters={
+                "min_silence_duration_ms": config.VAD_MIN_SILENCE_MS,  # граница при паузе >= 400мс
+                "speech_pad_ms":           config.VAD_SPEECH_PAD_MS,   # буфер 200мс вокруг речи
+            },
             condition_on_previous_text=False,     # отключаем bias — меньше галлюцинаций
             hallucination_silence_threshold=2.0,  # не повторять текст в паузах > 2с
         )
@@ -135,6 +139,7 @@ class Transcriber:
                         "start": float(w.start),
                         "end":   float(w.end),
                     })
+            words = _dedup_consecutive(words)  # убираем галлюцинации-повторы
 
             text = seg.text.strip()
             if not words and not text:
@@ -150,3 +155,21 @@ class Transcriber:
 
         log.info(f"Распознано сегментов: {len(result)}")
         return result
+
+
+# ── Утилита ────────────────────────────────────────────────────────────────────
+
+def _dedup_consecutive(words: list) -> list:
+    """
+    Удаляет подряд идущие одинаковые слова — артефакт Whisper-галлюцинаций.
+    Критерий: то же слово (без учёта регистра) с паузой < 0.5с между концом и началом.
+    """
+    result = []
+    for w in words:
+        if (result
+                and w["word"].lower() == result[-1]["word"].lower()
+                and w["start"] - result[-1]["end"] < 0.5):
+            log.debug(f"Dedup: убран дубль '{w['word']}' @ {w['start']:.2f}s")
+            continue
+        result.append(w)
+    return result
