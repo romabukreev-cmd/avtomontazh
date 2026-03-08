@@ -10,6 +10,7 @@ transcriber.py — транскрипция аудио через Whisper.
 сразу после завершения транскрипции, чтобы не занимать RAM постоянно.
 """
 
+import ctypes
 import gc
 import logging
 import subprocess
@@ -100,6 +101,10 @@ class Transcriber:
         del self._model
         self._model = None
         gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)  # возвращаем RAM операционной системе
+        except Exception:
+            pass
         log.info("Whisper выгружен")
 
     # ── Шаг 3: Транскрипция ───────────────────────────────────────────────────
