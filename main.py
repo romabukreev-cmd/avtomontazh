@@ -85,20 +85,27 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
     output_dir.mkdir(parents=True, exist_ok=True)
     renderer = VideoRenderer(screen_file, webcam_file, session.name)
 
-    def render_progress(pct: float) -> None:
-        bar = "▓" * int(pct / 10) + "░" * (10 - int(pct / 10))
-        progress(
-            f"▶ <b>{session.name}</b>\n\n"
-            "✅ Файлы готовы\n"
-            f"✅ Транскрипция: {len(blocks)} блоков ({format_duration(total_speech)})\n"
-            f"✅ AI: {len(kept)}/{len(scored_blocks)} блоков ({format_duration(kept_duration)})\n"
-            f"⏳ Рендер: [{bar}] {pct:.0f}%"
-        )
+    def render_progress_fmt(label: str) -> Callable[[float], None]:
+        def _cb(pct: float) -> None:
+            bar = "▓" * int(pct / 10) + "░" * (10 - int(pct / 10))
+            progress(
+                f"▶ <b>{session.name}</b>\n\n"
+                "✅ Файлы готовы\n"
+                f"✅ Транскрипция: {len(blocks)} блоков ({format_duration(total_speech)})\n"
+                f"✅ AI: {len(kept)}/{len(scored_blocks)} блоков ({format_duration(kept_duration)})\n"
+                f"⏳ Рендер {label}: [{bar}] {pct:.0f}%"
+            )
+        return _cb
 
     renderer.render_vertical(
         kept, output_dir,
         output_filename="vertical_9min.mp4",
-        progress_callback=render_progress,
+        progress_callback=render_progress_fmt("9:16"),
+    )
+    renderer.render_horizontal(
+        kept, output_dir,
+        output_filename="horizontal_9min.mp4",
+        progress_callback=render_progress_fmt("16:9"),
     )
 
     progress(
@@ -106,7 +113,7 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
         "✅ Файлы готовы\n"
         f"✅ Транскрипция: {len(blocks)} блоков ({format_duration(total_speech)})\n"
         f"✅ AI: {len(kept)}/{len(scored_blocks)} блоков ({format_duration(kept_duration)})\n"
-        "✅ Рендер завершён"
+        "✅ Рендер завершён (9:16 + 16:9)"
     )
     log.info(f"✅ Готово: {session.name}")
 

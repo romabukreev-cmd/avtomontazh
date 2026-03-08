@@ -85,6 +85,68 @@ class VideoRenderer:
         self._run_ffmpeg(cmd, total, progress_callback)
         return output_file
 
+    def render_horizontal(
+        self,
+        timeline: List[Dict],
+        output_dir: Path,
+        output_filename: str,
+        progress_callback: Optional[Callable[[float], None]] = None,
+    ) -> Path:
+        """
+        Рендерит горизонтальное видео 1920×1080 (экран на весь кадр, вебка PiP).
+
+        timeline — список блоков с полями start и end.
+        """
+        if not timeline:
+            raise ValueError("Пустой таймлайн — нечего рендерить")
+
+        output_file = output_dir / output_filename
+        screen_list = self._write_concat_list(self.screen_file, timeline, "screen_h")
+        webcam_list = self._write_concat_list(self.webcam_file, timeline, "webcam_h")
+
+        cy = config.SCREEN_CROP_Y  # 60 для 1920×1200, 0 для 1920×1080
+
+        # PiP параметры из config
+        pw = config.PIP_WIDTH
+        ph = config.PIP_HEIGHT
+        mr = config.PIP_MARGIN_RIGHT
+        mb = config.PIP_MARGIN_BOTTOM
+
+        total = sum(s["end"] - s["start"] for s in timeline)
+        fade_out_start = max(0.0, total - 0.5)
+
+        # Filtergraph:
+        #   [0:v] экран  → crop 1920×1080 (убираем лишние пиксели) → [screen]
+        #   [1:v] вебка  → crop центральный квадрат → scale pw×ph → [pip]
+        #   [screen][pip] → overlay в правый нижний угол → [vout]
+        #   [0:a]         → afade in/out → [aout]
+        filtergraph = (
+            f"[0:v]crop=1920:1080:0:{cy}[screen];"
+            f"[1:v]crop=1080:1080:420:0,scale={pw}:{ph}[pip];"
+            f"[screen][pip]overlay=W-w-{mr}:H-h-{mb}[vout];"
+            f"[0:a]afade=t=in:st=0:d=0.5,afade=t=out:st={fade_out_start:.3f}:d=0.5[aout]"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(screen_list),
+            "-f", "concat", "-safe", "0", "-i", str(webcam_list),
+            "-filter_complex", filtergraph,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-c:v", config.VIDEO_CODEC,
+            "-crf", str(config.VIDEO_CRF),
+            "-preset", config.VIDEO_PRESET,
+            "-c:a", config.AUDIO_CODEC,
+            "-b:a", config.AUDIO_BITRATE,
+            "-threads", str(config.FFMPEG_THREADS),
+            str(output_file),
+        ]
+
+        log.info(f"Рендер: {output_filename} ({len(timeline)} блоков, {total:.1f}с)")
+        self._run_ffmpeg(cmd, total, progress_callback)
+        return output_file
+
     # ── Вспомогательные методы ────────────────────────────────────────────────
 
     def _write_concat_list(self, source_file: Path, timeline: List[Dict], tag: str) -> Path:

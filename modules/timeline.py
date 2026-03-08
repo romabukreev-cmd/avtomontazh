@@ -59,10 +59,17 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
     return blocks
 
 
+_MAX_WORD_DURATION = 1.5  # сек: cap на длину слова — защита от плохих Whisper-таймстемпов
+
+
 def _words_to_block(words: List[Dict], buf: float) -> Dict:
+    # Whisper иногда выставляет word.end слишком далеко (особенно для последнего слова
+    # в сегменте). Ограничиваем: слово не может длиться дольше _MAX_WORD_DURATION.
+    last = words[-1]
+    capped_end = min(last["end"], last["start"] + _MAX_WORD_DURATION)
     return {
         "start": max(0.0, words[0]["start"] - buf),
-        "end":   words[-1]["end"] + buf,
+        "end":   capped_end + buf,
         "text":  " ".join(w["word"] for w in words).strip(),
         "words": words,
     }
