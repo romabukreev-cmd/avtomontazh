@@ -44,7 +44,9 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
     current = [all_words[0]]
 
     for word in all_words[1:]:
-        gap = word["start"] - current[-1]["end"]
+        # Используем кэпнутый end — иначе раздутый Whisper-таймстемп скрывает реальную паузу
+        last_end = min(current[-1]["end"], current[-1]["start"] + _MAX_WORD_DURATION)
+        gap = word["start"] - last_end
         if gap >= thr:
             blocks.append(_words_to_block(current, buf))
             current = [word]

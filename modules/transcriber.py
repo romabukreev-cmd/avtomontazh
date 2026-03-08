@@ -120,8 +120,9 @@ class Transcriber:
             str(audio_file),
             language=config.WHISPER_LANGUAGE,
             word_timestamps=True,
-            vad_filter=True,                 # Silero VAD: только реальная речь
-            condition_on_previous_text=False, # отключаем bias — меньше галлюцинаций
+            vad_filter=True,                      # Silero VAD: только реальная речь
+            condition_on_previous_text=False,     # отключаем bias — меньше галлюцинаций
+            hallucination_silence_threshold=2.0,  # не повторять текст в паузах > 2с
         )
 
         result = []
