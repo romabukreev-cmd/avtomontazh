@@ -41,42 +41,57 @@ from telegram.ext import (
 
 import config
 from modules.session_manager import Session, SessionManager
+from modules.session_manager import Session, SessionManager, StandardSession
 from modules.utils import format_duration
 
 log = logging.getLogger(__name__)
 
-_KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton("📥 Sync"),     KeyboardButton("📋 Сессии"), KeyboardButton("📊 Статус")],
-        [KeyboardButton("⛔ Отмена"),   KeyboardButton("🔄 Сброс")],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
+# ── Клавиатуры ────────────────────────────────────────────────────────────────
 
-# Текст кнопки → имя команды-обработчика
+def _make_keyboard(mode: str) -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура с кнопкой Назад."""
+    label = "🎬 Автоформат" if mode == "auto" else "📝 Стандартный"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton("📥 Sync"), KeyboardButton("📋 Сессии"), KeyboardButton("📊 Статус")],
+            [KeyboardButton("⛔ Отмена"), KeyboardButton("🔄 Сброс"), KeyboardButton("← Назад")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+# Текст кнопки → метод (без учёта регистра)
 _BUTTON_COMMANDS = {
     "📥 sync":      "_cmd_sync",
     "📋 сессии":    "_cmd_sessions",
     "📊 статус":    "_cmd_status",
     "⛔ отмена":    "_cmd_cancel",
     "🔄 сброс":     "_cmd_reset",
+    "← назад":     "_cmd_start",
 }
+
+# Inline-кнопки выбора сценария
+_MODE_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton("🎬 Автоформат",   callback_data="mode:auto"),
+    InlineKeyboardButton("📝 Стандартный",  callback_data="mode:standard"),
+]])
 
 
 class AutomontazhBot:
 
-    def __init__(self, pipeline_fn: Callable):
+    def __init__(self, auto_pipeline_fn: Callable, standard_pipeline_fn: Callable):
         """
-        pipeline_fn — функция из main.py которая запускает полный пайплайн обработки.
-        Сигнатура: pipeline_fn(session, progress_callback) → None
+        auto_pipeline_fn     — пайплайн Автоформат (session, progress) → None
+        standard_pipeline_fn — пайплайн Стандартный (standard_session, progress) → None
         """
-        self.pipeline_fn     = pipeline_fn
+        self.auto_pipeline_fn     = auto_pipeline_fn
+        self.standard_pipeline_fn = standard_pipeline_fn
         self.session_manager = SessionManager()
         self.is_processing   = False
         self.current_session: Optional[str] = None
-        self._queue: List[Session] = []   # очередь сессий для автоматической обработки
-        self._app = None                   # ссылка на Application (нужна для отправки сообщений из очереди)
+        self._queue: list = []         # очередь (Session или StandardSession)
+        self._mode: str   = "auto"     # "auto" или "standard"
+        self._app = None
 
     # ── Запуск бота ───────────────────────────────────────────────────────────
 
@@ -108,9 +123,11 @@ class AutomontazhBot:
         app.add_handler(CommandHandler("cancel",   self._cmd_cancel))
         app.add_handler(CommandHandler("reset",    self._cmd_reset))
 
-        # Обработчик нажатий на inline-кнопки (выбор сессии / сброс)
-        app.add_handler(CallbackQueryHandler(self._on_session_selected, pattern="^process:"))
-        app.add_handler(CallbackQueryHandler(self._on_reset_selected,   pattern="^reset:"))
+        # Обработчик нажатий на inline-кнопки
+        app.add_handler(CallbackQueryHandler(self._on_mode_selected,     pattern="^mode:"))
+        app.add_handler(CallbackQueryHandler(self._on_session_selected,  pattern="^process:"))
+        app.add_handler(CallbackQueryHandler(self._on_reset_selected,    pattern="^reset:"))
+        app.add_handler(CallbackQueryHandler(self._on_all_sessions,      pattern="^all_sessions$"))
 
         # Обработчик кнопок постоянной клавиатуры
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_keyboard_button))
@@ -123,15 +140,32 @@ class AutomontazhBot:
     async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_allowed(update):
             return
-
         await update.message.reply_text(
-            "Привет! Я Автомонтаж.\n\nИспользуй кнопки ниже или команды:\n"
-            "/sync — скачать файлы с Google Drive\n"
-            "/sessions — сессии для обработки\n"
-            "/status — статус и очередь\n"
-            "/cancel — остановить обработку\n"
-            "/reset — сбросить незавершённую сессию",
-            reply_markup=_KEYBOARD,
+            "Выбери сценарий обработки:",
+            reply_markup=_MODE_KEYBOARD,
+        )
+
+    async def _on_mode_selected(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка выбора сценария."""
+        query = update.callback_query
+        await query.answer()
+        if not self._is_allowed(update):
+            return
+
+        self._mode = query.data.replace("mode:", "")
+        label = "🎬 Автоформат" if self._mode == "auto" else "📝 Стандартный"
+        await query.edit_message_text(f"Режим: <b>{label}</b>", parse_mode="HTML")
+        await self._app.bot.send_message(
+            chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
+            text=(
+                f"Режим <b>{label}</b> активен.\n\n"
+                "Используй кнопки ниже или команды:\n"
+                "/sync — скачать файлы с Google Drive\n"
+                "/sessions — сессии для обработки\n"
+                "/status — статус и очередь"
+            ),
+            reply_markup=_make_keyboard(self._mode),
+            parse_mode="HTML",
         )
 
     async def _on_keyboard_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -172,28 +206,32 @@ class AutomontazhBot:
         if not self._is_allowed(update):
             return
 
-        sessions = self.session_manager.scan_sessions()
+        if self._mode == "standard":
+            sessions = self.session_manager.scan_standard_sessions()
+        else:
+            sessions = self.session_manager.scan_sessions()
 
         if not sessions:
+            mode_label = "Стандартный" if self._mode == "standard" else "Автоформат"
             await update.message.reply_text(
-                "Нет сессий для обработки.\n"
+                f"Нет сессий для обработки ({mode_label}).\n"
                 "Загрузи файлы на Google Drive и выполни /sync"
             )
             return
 
         queued_names = {s.name for s in self._queue}
-
-        if self.is_processing:
-            status_line = f"⏳ Сейчас: <b>{self.current_session}</b>\n"
-        else:
-            status_line = ""
-
-        if self._queue:
-            queue_line = "Очередь: " + " → ".join(s.name for s in self._queue) + "\n"
-        else:
-            queue_line = ""
+        status_line = f"⏳ Сейчас: <b>{self.current_session}</b>\n" if self.is_processing else ""
+        queue_line  = ("Очередь: " + " → ".join(s.name for s in self._queue) + "\n") if self._queue else ""
 
         keyboard = []
+
+        # Кнопка "Запустить все" если несколько сессий не в очереди
+        free = [s for s in sessions if s.name not in queued_names and s.name != self.current_session]
+        if len(free) > 1:
+            keyboard.append([InlineKeyboardButton(
+                f"▶ Запустить все ({len(free)})", callback_data="all_sessions"
+            )])
+
         for s in sessions:
             if s.name == self.current_session:
                 label = f"⏳ {s.name} (обрабатывается)"
@@ -201,7 +239,9 @@ class AutomontazhBot:
                 pos = next(i + 1 for i, q in enumerate(self._queue) if q.name == s.name)
                 label = f"#{pos} в очереди: {s.name}"
             else:
-                label = f"{s.name}  ({s.file_count} файл{'а' if s.file_count in (2, 3, 4) else 'ов'})"
+                cnt = s.file_count
+                marker = " 📄" if (self._mode == "standard" and getattr(s, "has_scenario", False)) else ""
+                label = f"{s.name}  ({cnt} файл{'а' if cnt in (2,3,4) else 'ов'}){marker}"
             keyboard.append([InlineKeyboardButton(label, callback_data=f"process:{s.name}")])
 
         await update.message.reply_text(
@@ -235,6 +275,45 @@ class AutomontazhBot:
 
     # ── Callback: выбор сессии ────────────────────────────────────────────────
 
+    async def _on_all_sessions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Добавляет все свободные сессии в очередь."""
+        query = update.callback_query
+        await query.answer()
+        if not self._is_allowed(update):
+            return
+
+        if self._mode == "standard":
+            all_sessions = self.session_manager.scan_standard_sessions()
+        else:
+            all_sessions = self.session_manager.scan_sessions()
+
+        queued_names = {s.name for s in self._queue}
+        free = [s for s in all_sessions
+                if s.name not in queued_names and s.name != self.current_session]
+
+        if not free:
+            await query.edit_message_text("Нет свободных сессий для добавления.")
+            return
+
+        added = []
+        for s in free:
+            if not self.is_processing and not added:
+                status_msg = await self._app.bot.send_message(
+                    chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
+                    text=f"▶ Начинаю обработку: <b>{s.name}</b>",
+                    parse_mode="HTML",
+                )
+                asyncio.create_task(self._run_pipeline(s, status_msg))
+            else:
+                self._queue.append(s)
+            added.append(s.name)
+
+        names = "\n".join(f"  • {n}" for n in added)
+        await query.edit_message_text(
+            f"✅ Запущено/поставлено в очередь ({len(added)}):\n{names}",
+            parse_mode="HTML",
+        )
+
     async def _on_session_selected(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Вызывается когда пользователь нажимает кнопку с именем сессии."""
         query = update.callback_query
@@ -245,7 +324,6 @@ class AutomontazhBot:
 
         session_name = query.data.replace("process:", "")
 
-        # Проверяем что не уже в очереди
         if any(s.name == session_name for s in self._queue):
             pos = next(i + 1 for i, s in enumerate(self._queue) if s.name == session_name)
             await query.edit_message_text(
@@ -254,15 +332,18 @@ class AutomontazhBot:
             )
             return
 
-        sessions = self.session_manager.scan_sessions()
-        session  = next((s for s in sessions if s.name == session_name), None)
+        if self._mode == "standard":
+            all_sessions = self.session_manager.scan_standard_sessions()
+        else:
+            all_sessions = self.session_manager.scan_sessions()
+
+        session = next((s for s in all_sessions if s.name == session_name), None)
 
         if session is None:
             await query.edit_message_text(f"❌ Сессия '{session_name}' не найдена или уже обработана.")
             return
 
         if self.is_processing:
-            # Добавляем в очередь
             self._queue.append(session)
             pos = len(self._queue)
             queue_names = " → ".join(s.name for s in self._queue)
@@ -274,24 +355,24 @@ class AutomontazhBot:
             )
             return
 
-        # Начинаем обработку немедленно
+        mode_label = "[Стандартный]" if self._mode == "standard" else ""
         status_msg = await query.edit_message_text(
-            f"▶ Начинаю обработку: <b>{session_name}</b>\n"
-            f"Файлов: {session.file_count} экран + {session.file_count} вебка",
+            f"▶ Начинаю обработку: <b>{session_name}</b> {mode_label}",
             parse_mode="HTML"
         )
         asyncio.create_task(self._run_pipeline(session, status_msg))
 
     # ── Основной пайплайн (запускается как asyncio task) ──────────────────────
 
-    async def _run_pipeline(self, session: Session, status_msg) -> None:
+    async def _run_pipeline(self, session, status_msg) -> None:
         """
-        Запускает пайплайн обработки для одной сессии.
+        Запускает пайплайн обработки для одной сессии (Session или StandardSession).
         После завершения автоматически запускает следующую сессию из очереди.
         """
         session_name = session.name
         self.is_processing   = True
         self.current_session = session_name
+        is_standard = isinstance(session, StandardSession)
 
         loop = asyncio.get_running_loop()
 
@@ -308,8 +389,9 @@ class AutomontazhBot:
             except Exception:
                 pass
 
+        pipeline_fn = self.standard_pipeline_fn if is_standard else self.auto_pipeline_fn
         try:
-            await asyncio.to_thread(self.pipeline_fn, session, sync_progress)
+            await asyncio.to_thread(pipeline_fn, session, sync_progress)
 
             # Отправляем отдельное сообщение о загрузке — саммари в status_msg не трогаем
             upload_msg = await self._app.bot.send_message(

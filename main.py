@@ -14,13 +14,14 @@ import sys
 from typing import Callable
 
 import config
-from modules.bot             import AutomontazhBot
-from modules.session_manager import Session, SessionManager
-from modules.transcriber     import Transcriber
-from modules.llm_analyzer    import LLMAnalyzer
-from modules.timeline        import build_blocks, total_duration
-from modules.renderer        import VideoRenderer
-from modules.utils           import setup_logging, ensure_dirs, format_duration
+from modules.bot               import AutomontazhBot
+from modules.session_manager   import Session, SessionManager, StandardSession
+from modules.transcriber       import Transcriber
+from modules.llm_analyzer      import LLMAnalyzer
+from modules.timeline          import build_blocks, total_duration
+from modules.renderer          import VideoRenderer
+from modules.standard_pipeline import process_standard_session
+from modules.utils             import setup_logging, ensure_dirs, format_duration
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -156,10 +157,16 @@ def main() -> None:
 
     transcriber = Transcriber()
 
-    def _pipeline(session: Session, progress: Callable) -> None:
+    def _auto_pipeline(session: Session, progress: Callable) -> None:
         process_session(session, progress, transcriber=transcriber)
 
-    bot = AutomontazhBot(pipeline_fn=_pipeline)
+    def _standard_pipeline(session: StandardSession, progress: Callable) -> None:
+        process_standard_session(session, progress, transcriber=transcriber)
+
+    bot = AutomontazhBot(
+        auto_pipeline_fn=_auto_pipeline,
+        standard_pipeline_fn=_standard_pipeline,
+    )
     bot.run()
 
 

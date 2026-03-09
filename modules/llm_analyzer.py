@@ -60,6 +60,28 @@ _SYSTEM_PROMPT = """\
 """
 
 
+_STANDARD_SYSTEM_PROMPT = """\
+Ты монтажёр Reels. Автор записал ролик по сценарию, делая несколько дублей каждой части.
+
+Твоя задача — для каждой части сценария найти все её дубли в транскрипции и оставить только ПОСЛЕДНИЙ. Все предыдущие неудачные дубли — удалять.
+
+Как определить дубли:
+- Автор начинает говорить ту же часть сценария заново (перефразированно или почти дословно)
+- Дубли всегда идут подряд или через 1-2 коротких блока (запинки, паузы)
+- Последний дубль — тот, после которого автор переходит к следующей части сценария
+
+Что НЕ является дублями (не удалять):
+- Разные варианты CTA (призыв к действию) для разных платформ — даже если похожи по структуре. Признак: упоминают разные платформы (Telegram, Instagram, ВКонтакте), разные ссылки или разные действия. Все варианты CTA оставляй.
+- Переходы и связки между частями сценария
+- Блоки с новой информацией, которой нет в предыдущих дублях
+
+Формат ответа — строго JSON, без пояснений:
+{"delete": [0, 1, 3]}
+
+Если удалять нечего — {"delete": []}\
+"""
+
+
 class LLMAnalyzer:
 
     def analyze(self, blocks: List[Dict]) -> List[Dict]:
@@ -97,6 +119,46 @@ class LLMAnalyzer:
         log.error(f"LLM не ответил: {last_error}. Оставляю все блоки.")
         return self._apply_decisions(blocks, set())
 
+    def analyze_with_scenario(self, blocks: List[Dict], scenario_text: str) -> List[Dict]:
+        """
+        Анализирует блоки зная текст сценария.
+        Оставляет последний дубль каждой части, удаляет предыдущие.
+
+        Args:
+            blocks: список блоков из timeline.build_blocks()
+            scenario_text: текст сценария из scenario.txt
+        Returns:
+            те же блоки с полем keep=True/False
+        """
+        if not blocks:
+            return []
+
+        user_prompt = (
+            f"СЦЕНАРИЙ:\n---\n{scenario_text.strip()}\n---\n\n"
+            + self._format_transcript(blocks)
+        )
+        log.info(f"LLM (сценарий): {len(blocks)} блоков")
+
+        last_error = None
+        for attempt in range(config.LLM_MAX_RETRIES):
+            try:
+                raw = self._call_api_with_model(
+                    _STANDARD_SYSTEM_PROMPT, user_prompt, config.STANDARD_LLM_MODEL
+                )
+                delete_set = self._parse_response(raw, len(blocks))
+                result = self._apply_decisions(blocks, delete_set)
+                kept = sum(1 for b in result if b["keep"])
+                log.info(f"LLM (сценарий): оставлено {kept}/{len(result)}, удалено {len(delete_set)}")
+                return result
+            except Exception as e:
+                last_error = e
+                wait = 2 ** attempt
+                log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES}: {e}. Жду {wait}с...")
+                time.sleep(wait)
+
+        log.error(f"LLM не ответил: {last_error}. Оставляю все блоки.")
+        return self._apply_decisions(blocks, set())
+
     # ── Форматирование транскрипции ────────────────────────────────────────────
 
     def _format_transcript(self, blocks: List[Dict]) -> str:
@@ -116,6 +178,27 @@ class LLMAnalyzer:
         return "\n".join(lines)
 
     # ── API ────────────────────────────────────────────────────────────────────
+
+    def _call_api_with_model(self, system: str, user: str, model: str) -> str:
+        response = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+                "Content-Type":  "application/json",
+                "HTTP-Referer":  "https://github.com/automontazh",
+            },
+            json={
+                "model":       model,
+                "messages":    [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+                "temperature": 0.2,
+            },
+            timeout=120.0,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
 
     def _call_api(self, system: str, user: str) -> str:
         response = httpx.post(

@@ -34,6 +34,17 @@ VIDEO_EXTENSIONS    = {".mp4", ".mkv", ".avi", ".mov", ".ts"}
 WHISPER_MODEL    = "large-v3"
 WHISPER_LANGUAGE = "ru"
 
+# ─── Стандартный сценарий (нарезка Reels по дублям) ──────────────────────────
+
+# Буфер вокруг удачного дубля при вырезании (1с с каждой стороны)
+STANDARD_CLIP_GAP_SEC = 1.0
+
+# Модель для анализа по сценарию (можно поменять на "openai/gpt-4o")
+STANDARD_LLM_MODEL = "anthropic/claude-sonnet-4-6"
+
+# Имя файла сценария в папке сессии
+STANDARD_SCENARIO_FILENAME = "scenario.txt"
+
 # ─── Silero VAD (детекция речи, встроена в faster-whisper) ───────────────────
 
 # Пауза длиннее этого значения → граница между сегментами
