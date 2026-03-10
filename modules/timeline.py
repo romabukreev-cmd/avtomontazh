@@ -1,11 +1,9 @@
 """
 timeline.py — разбивает Whisper-слова на речевые блоки по паузам.
 
-Блок = непрерывная речь без пауз >= VAD_MIN_SILENCE_MS.
+Блок = непрерывная речь без пауз >= PAUSE_THRESHOLD_SEC.
 Паузы между блоками вырезаются автоматически — в финальный таймлайн
 попадают только сами блоки (LLM решает какие оставить, какие удалить).
-
-Мелкие блоки (одна фраза) дают LLM нужную гранулярность для поиска перезаписей.
 """
 
 import logging
@@ -15,7 +13,9 @@ import config
 
 log = logging.getLogger(__name__)
 
-_MAX_WORD_DURATION = 1.5  # сек: cap на длину слова — защита от плохих Whisper-таймстемпов
+# Cap на длину слова: защита от раздутых Whisper-таймстемпов при детекции пауз.
+# Например Whisper иногда отмечает "да" как длиной 4с — это скрывает реальную паузу.
+_MAX_WORD_DURATION = 1.5  # секунды
 
 
 def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
@@ -24,12 +24,8 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
 
     Алгоритм:
       1. Собираем все слова из всех сегментов в единый поток
-      2. Глобальная дедупликация — убираем кросс-сегментные галлюцинации Whisper
-      3. Разбиваем по паузам >= VAD_MIN_SILENCE_MS → речевые блоки
-      4. Каждый блок получает start/end с буфером VAD_SPEECH_PAD_MS
-      5. Клиппинг буферов: блок не может заходить в территорию соседнего блока
-
-    Мелкая нарезка (по словесным паузам) даёт LLM видимость перезаписей.
+      2. Разбиваем по паузам >= PAUSE_THRESHOLD_SEC → речевые блоки
+      3. Каждый блок получает start/end с буферами из config
 
     Returns:
         [{"index": 0, "start": 0.3, "end": 5.0, "text": "...", "words": [...]}, ...]
@@ -45,11 +41,11 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
 
     all_words.sort(key=lambda w: w["start"])
 
-    start_buf = config.BLOCK_START_BUFFER_SEC  # маленький: не тянуть вдохи/хвосты
-    end_buf   = config.BLOCK_END_BUFFER_SEC    # нормальный: естественное затухание слова
-    thr       = config.VAD_MIN_SILENCE_MS / 1000.0  # мс → секунды
+    thr       = config.PAUSE_THRESHOLD_SEC
+    start_buf = config.BLOCK_START_BUFFER_SEC
+    end_buf   = config.BLOCK_END_BUFFER_SEC
 
-    blocks = []
+    blocks  = []
     current = [all_words[0]]
 
     for word in all_words[1:]:
@@ -57,21 +53,26 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
         last_end = min(current[-1]["end"], current[-1]["start"] + _MAX_WORD_DURATION)
         gap = word["start"] - last_end
         if gap >= thr:
-            blocks.append(_words_to_block(current, start_buf, end_buf))
+            blocks.append(_make_block(current, start_buf, end_buf))
             current = [word]
         else:
             current.append(word)
-    blocks.append(_words_to_block(current, start_buf, end_buf))
+    blocks.append(_make_block(current, start_buf, end_buf))
 
     for i, b in enumerate(blocks):
         b["index"] = i
 
-    log.info(f"Речевых блоков: {len(blocks)} (порог: {thr}с, start_buf: {start_buf}с, end_buf: {end_buf}с)")
+    log.info(f"Речевых блоков: {len(blocks)} (порог паузы: {thr}с)")
     return blocks
 
 
-def _words_to_block(words: List[Dict], start_buf: float, end_buf: float) -> Dict:
-    last = words[-1]
+def total_duration(blocks: List[Dict]) -> float:
+    """Суммарная длительность kept-блоков в секундах."""
+    return sum(b["end"] - b["start"] for b in blocks)
+
+
+def _make_block(words: List[Dict], start_buf: float, end_buf: float) -> Dict:
+    last       = words[-1]
     capped_end = min(last["end"], last["start"] + _MAX_WORD_DURATION)
     return {
         "start": max(0.0, words[0]["start"] - start_buf),
@@ -79,8 +80,3 @@ def _words_to_block(words: List[Dict], start_buf: float, end_buf: float) -> Dict
         "text":  " ".join(w["word"] for w in words).strip(),
         "words": words,
     }
-
-
-def total_duration(blocks: List[Dict]) -> float:
-    """Суммарная длительность блоков в секундах."""
-    return sum(b["end"] - b["start"] for b in blocks)
