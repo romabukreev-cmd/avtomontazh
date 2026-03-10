@@ -53,8 +53,9 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
     if not all_words:
         return []
 
-    buf = config.VAD_SPEECH_PAD_MS / 1000.0   # мс → секунды
-    thr = config.VAD_MIN_SILENCE_MS / 1000.0  # мс → секунды
+    start_buf = config.BLOCK_START_BUFFER_SEC  # маленький: не тянуть вдохи/хвосты
+    end_buf   = config.BLOCK_END_BUFFER_SEC    # нормальный: естественное затухание слова
+    thr       = config.VAD_MIN_SILENCE_MS / 1000.0  # мс → секунды
 
     blocks = []
     current = [all_words[0]]
@@ -64,11 +65,11 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
         last_end = min(current[-1]["end"], current[-1]["start"] + _MAX_WORD_DURATION)
         gap = word["start"] - last_end
         if gap >= thr:
-            blocks.append(_words_to_block(current, buf))
+            blocks.append(_words_to_block(current, start_buf, end_buf))
             current = [word]
         else:
             current.append(word)
-    blocks.append(_words_to_block(current, buf))
+    blocks.append(_words_to_block(current, start_buf, end_buf))
 
     # Клиппинг буферов: блок не может заходить в область слов соседнего блока.
     # Защита от неточных Whisper-таймстемпов на границах блоков.
@@ -86,16 +87,16 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
     for i, b in enumerate(blocks):
         b["index"] = i
 
-    log.info(f"Речевых блоков: {len(blocks)} (порог: {thr}с, буфер: {buf}с)")
+    log.info(f"Речевых блоков: {len(blocks)} (порог: {thr}с, start_buf: {start_buf}с, end_buf: {end_buf}с)")
     return blocks
 
 
-def _words_to_block(words: List[Dict], buf: float) -> Dict:
+def _words_to_block(words: List[Dict], start_buf: float, end_buf: float) -> Dict:
     last = words[-1]
     capped_end = min(last["end"], last["start"] + _MAX_WORD_DURATION)
     return {
-        "start": max(0.0, words[0]["start"] - buf),
-        "end":   capped_end + buf,
+        "start": max(0.0, words[0]["start"] - start_buf),
+        "end":   capped_end + end_buf,
         "text":  " ".join(w["word"] for w in words).strip(),
         "words": words,
     }
