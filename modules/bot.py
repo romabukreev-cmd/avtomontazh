@@ -49,12 +49,11 @@ log = logging.getLogger(__name__)
 # ── Клавиатуры ────────────────────────────────────────────────────────────────
 
 def _make_keyboard(mode: str) -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура с кнопкой Назад."""
-    label = "🎬 Автоформат" if mode == "auto" else "📝 Стандартный"
+    """Постоянная клавиатура."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton("📥 Sync"), KeyboardButton("📋 Сессии"), KeyboardButton("📊 Статус")],
-            [KeyboardButton("⛔ Отмена"), KeyboardButton("🔄 Сброс"), KeyboardButton("← Назад")],
+            [KeyboardButton("⛔ Отмена"), KeyboardButton("🔄 Сброс"), KeyboardButton("🗑 Output"), KeyboardButton("← Назад")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -67,6 +66,7 @@ _BUTTON_COMMANDS = {
     "📊 статус":    "_cmd_status",
     "⛔ отмена":    "_cmd_cancel",
     "🔄 сброс":     "_cmd_reset",
+    "🗑 output":    "_cmd_clear_output",
     "← назад":     "_cmd_start",
 }
 
@@ -120,14 +120,16 @@ class AutomontazhBot:
         app.add_handler(CommandHandler("sync",     self._cmd_sync))
         app.add_handler(CommandHandler("sessions", self._cmd_sessions))
         app.add_handler(CommandHandler("status",   self._cmd_status))
-        app.add_handler(CommandHandler("cancel",   self._cmd_cancel))
-        app.add_handler(CommandHandler("reset",    self._cmd_reset))
+        app.add_handler(CommandHandler("cancel",       self._cmd_cancel))
+        app.add_handler(CommandHandler("reset",        self._cmd_reset))
+        app.add_handler(CommandHandler("clear_output", self._cmd_clear_output))
 
         # Обработчик нажатий на inline-кнопки
         app.add_handler(CallbackQueryHandler(self._on_mode_selected,     pattern="^mode:"))
         app.add_handler(CallbackQueryHandler(self._on_session_selected,  pattern="^process:"))
         app.add_handler(CallbackQueryHandler(self._on_reset_selected,    pattern="^reset:"))
         app.add_handler(CallbackQueryHandler(self._on_all_sessions,      pattern="^all_sessions$"))
+        app.add_handler(CallbackQueryHandler(self._on_clear_confirmed,  pattern="^clear_output_confirm$"))
 
         # Обработчик кнопок постоянной клавиатуры
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_keyboard_button))
@@ -525,6 +527,55 @@ class AutomontazhBot:
             )
         else:
             await query.edit_message_text(f"Папка <b>{session_name}</b> не найдена.", parse_mode="HTML")
+
+    async def _cmd_clear_output(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_allowed(update):
+            return
+
+        if self.is_processing:
+            await update.message.reply_text(
+                f"⏳ Сейчас идёт обработка: <b>{self.current_session}</b>\n"
+                "Дождись завершения или останови через /cancel.",
+                parse_mode="HTML",
+            )
+            return
+
+        if not config.OUTPUT_DIR.exists():
+            await update.message.reply_text("Папка output пуста.")
+            return
+
+        folders = sorted(d for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
+        if not folders:
+            await update.message.reply_text("Папка output пуста.")
+            return
+
+        names = "\n".join(f"  • {d.name}" for d in folders)
+        await update.message.reply_text(
+            f"Будет удалено ({len(folders)} сессий):\n{names}\n\nПодтверждаешь?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Да, удалить всё", callback_data="clear_output_confirm"),
+                InlineKeyboardButton("Отмена", callback_data="clear_output_cancel"),
+            ]]),
+        )
+
+    async def _on_clear_confirmed(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        if not self._is_allowed(update):
+            return
+
+        import shutil
+        if not config.OUTPUT_DIR.exists():
+            await query.edit_message_text("Папка output уже пуста.")
+            return
+
+        folders = sorted(d for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
+        count = len(folders)
+        for d in folders:
+            shutil.rmtree(d)
+            log.info(f"clear_output: удалена папка {d.name}")
+
+        await query.edit_message_text(f"✅ Удалено {count} сессий из output.")
 
     def _run_rclone_sync(self) -> None:
         remote_path = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_INPUT_PATH}"
