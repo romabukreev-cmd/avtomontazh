@@ -45,14 +45,6 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
 
     all_words.sort(key=lambda w: w["start"])
 
-    # Глобальная дедупликация: убираем одинаковые слова на стыках Whisper-сегментов.
-    # Whisper иногда повторяет последнее слово сегмента в начале следующего.
-    # per-segment dedup в transcriber.py не ловит эти кросс-сегментные дубли.
-    all_words = _dedup_words(all_words)
-
-    if not all_words:
-        return []
-
     start_buf = config.BLOCK_START_BUFFER_SEC  # маленький: не тянуть вдохи/хвосты
     end_buf   = config.BLOCK_END_BUFFER_SEC    # нормальный: естественное затухание слова
     thr       = config.VAD_MIN_SILENCE_MS / 1000.0  # мс → секунды
@@ -70,19 +62,6 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
         else:
             current.append(word)
     blocks.append(_words_to_block(current, start_buf, end_buf))
-
-    # Клиппинг буферов: блок не может заходить в область слов соседнего блока.
-    # Защита от неточных Whisper-таймстемпов на границах блоков.
-    for i, block in enumerate(blocks):
-        if i + 1 < len(blocks):
-            next_word_start = blocks[i + 1]["words"][0]["start"]
-            if block["end"] > next_word_start:
-                block["end"] = next_word_start
-        if i > 0:
-            prev = blocks[i - 1]["words"][-1]
-            prev_capped_end = min(prev["end"], prev["start"] + _MAX_WORD_DURATION)
-            if block["start"] < prev_capped_end:
-                block["start"] = prev_capped_end
 
     for i, b in enumerate(blocks):
         b["index"] = i
@@ -105,25 +84,3 @@ def _words_to_block(words: List[Dict], start_buf: float, end_buf: float) -> Dict
 def total_duration(blocks: List[Dict]) -> float:
     """Суммарная длительность блоков в секундах."""
     return sum(b["end"] - b["start"] for b in blocks)
-
-
-def _dedup_words(words: List[Dict]) -> List[Dict]:
-    """
-    Глобальная дедупликация слов после объединения всех Whisper-сегментов.
-
-    Whisper иногда повторяет одно и то же слово на стыке сегментов:
-    конец сегмента N и начало сегмента N+1 содержат одно слово.
-    Per-segment dedup в transcriber.py это не ловит.
-
-    Порог 0.3с — достаточно для граничных галлюцинаций, не удаляет реальные повторы.
-    """
-    if not words:
-        return words
-    result = [words[0]]
-    for w in words[1:]:
-        if (w["word"].lower() == result[-1]["word"].lower()
-                and w["start"] - result[-1]["end"] < 0.3):
-            log.debug(f"Global dedup: убран '{w['word']}' @ {w['start']:.2f}s")
-            continue
-        result.append(w)
-    return result
