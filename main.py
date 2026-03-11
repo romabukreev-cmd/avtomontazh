@@ -73,7 +73,7 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
         "⏳ AI анализирует повторы..."
     )
     analyzer = LLMAnalyzer()
-    scored_blocks = analyzer.analyze(blocks)
+    scored_blocks = analyzer.analyze(blocks, segments)
     kept = [b for b in scored_blocks if b["keep"]]
     kept_duration = total_duration(kept)
     log.info(f"После LLM: {len(kept)}/{len(scored_blocks)} блоков ({format_duration(kept_duration)})")

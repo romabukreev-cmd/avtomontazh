@@ -83,9 +83,9 @@ def process_standard_session(
     )
     analyzer = LLMAnalyzer()
     if scenario_text:
-        scored_blocks = analyzer.analyze_with_scenario(blocks, scenario_text)
+        scored_blocks = analyzer.analyze_with_scenario(blocks, scenario_text, segments)
     else:
-        scored_blocks = analyzer.analyze(blocks)
+        scored_blocks = analyzer.analyze(blocks, segments)
 
     kept = [b for b in scored_blocks if b["keep"]]
     kept_duration = total_duration(kept)

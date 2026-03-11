@@ -1,11 +1,14 @@
 """
 llm_analyzer.py — анализ транскрипции через LLM (OpenRouter API).
 
-Использует промпт в том же формате что работает у пользователя вручную:
-LLM возвращает {"repeats": [{"delete": "текст", "keep": "текст"}]}.
-Код сопоставляет текстовые фрагменты обратно с блоками по словесному перекрытию.
+Сегментный режим (основной):
+  LLM получает пронумерованные Whisper-сегменты в формате [N] MM:SS --- текст.
+  LLM возвращает {"delete": [1, 3, 5]} — номера сегментов для удаления.
+  Маппим сегменты → блоки по времени (mid блока попадает в диапазон сегмента).
 
-Это точнее чем просить LLM считать индексы блоков.
+Текстовый режим (fallback, если segments не переданы):
+  LLM видит блоки как текст, возвращает {"repeats": [{"delete":"...","keep":"..."}]}.
+  Текстовое сопоставление через SequenceMatcher.
 """
 
 import json
@@ -21,6 +24,60 @@ import config
 
 log = logging.getLogger(__name__)
 
+
+# ── Промпты: сегментный режим ──────────────────────────────────────────────────
+
+_SEGMENT_SYSTEM_PROMPT = """\
+Ты редактор видео-транскрипций. Твоя задача — найти все места где автор повторяет одну и ту же мысль несколько раз подряд, и оставить только финальную попытку.
+
+Важно: Анализируй весь текст целиком, не блоками.
+
+Что считается повтором:
+Автор говорит одну и ту же мысль разными словами несколько раз подряд. Это не пересказ — это попытки сформулировать одно и то же. Между попытками нет новой информации, только переформулировка.
+
+Примеры повторов:
+- [1] "Итак, давайте сделаем карточку" → [2] "Итак, давайте нарисуем карточку" → удаляем [1], оставляем [2]
+- [3] "Отправляюсь в синтекс" → [4] "Отправляюсь синтакс дизайн" → [5] "Открываю раздел Design" → удаляем [3][4], оставляем [5]
+- [6] "перед этим перемещу" → [7] "перед этим перемещу" → [8] "перед этим перемещу" → удаляем [6][7], оставляем [8]
+
+Что НЕ является повтором:
+- Автор возвращается к теме через несколько минут с новой информацией
+- Автор подводит итог того что уже сделал
+- Автор объясняет зачем он что-то делает
+
+Формат ответа — строго JSON, без пояснений до и после:
+{"delete": [1, 3, 4]}
+
+Где числа — номера сегментов для удаления (цифры в квадратных скобках перед временем).
+Если повторов нет — {"delete": []}\
+"""
+
+_SEGMENT_STANDARD_SYSTEM_PROMPT = """\
+Ты монтажёр Reels. Автор записал ролик по сценарию, делая несколько дублей каждой части.
+
+Твоя задача — для каждой части сценария найти все её дубли в транскрипции и оставить только ПОСЛЕДНИЙ. Все предыдущие неудачные дубли — удалять.
+
+Важно: Анализируй весь текст целиком, не блоками.
+
+Как определить дубли:
+- Автор начинает говорить ту же часть сценария заново (перефразированно или почти дословно)
+- Дубли всегда идут подряд или через 1-2 коротких сегмента (запинки, паузы)
+- Последний дубль — тот, после которого автор переходит к следующей части сценария
+
+Что НЕ является дублями (не удалять):
+- Разные варианты CTA (призыв к действию) для разных платформ — даже если похожи по структуре. Признак: упоминают разные платформы (Telegram, Instagram, ВКонтакте), разные ссылки или разные действия. Все варианты CTA оставляй.
+- Переходы и связки между частями сценария
+- Блоки с новой информацией, которой нет в предыдущих дублях
+
+Формат ответа — строго JSON, без пояснений:
+{"delete": [1, 3, 4]}
+
+Где числа — номера сегментов для удаления (цифры в квадратных скобках перед временем).
+Если удалять нечего — {"delete": []}\
+"""
+
+
+# ── Промпты: текстовый режим (fallback) ───────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
 Ты редактор видео-транскрипций. Твоя задача — найти все места где автор повторяет одну и ту же мысль несколько раз подряд, и оставить только финальную попытку.
@@ -89,25 +146,164 @@ _STANDARD_SYSTEM_PROMPT = """\
 
 class LLMAnalyzer:
 
-    def analyze(self, blocks: List[Dict]) -> List[Dict]:
+    def analyze(self, blocks: List[Dict], segments: List[Dict] = None) -> List[Dict]:
         """
         Анализирует речевые блоки, маркирует повторы как keep=False.
 
         Args:
-            blocks: список блоков из timeline.build_blocks()
+            blocks:   список блоков из timeline.build_blocks()
+            segments: Whisper-сегменты (sentence-level) для формирования промпта.
+                      Если переданы — сегментный режим (надёжнее, без эвристик).
+                      Если None — текстовый режим (fallback).
         Returns:
             те же блоки с полем keep=True/False
         """
         if not blocks:
             return []
 
-        user_prompt = self._format_transcript(blocks)
-        log.info(f"LLM анализ: {len(blocks)} блоков")
+        if segments:
+            return self._analyze_by_segments(blocks, segments, _SEGMENT_SYSTEM_PROMPT)
+        else:
+            return self._analyze_by_text(blocks, _SYSTEM_PROMPT)
+
+    def analyze_with_scenario(
+        self, blocks: List[Dict], scenario_text: str, segments: List[Dict] = None
+    ) -> List[Dict]:
+        """Анализирует блоки зная текст сценария."""
+        if not blocks:
+            return []
+
+        if segments:
+            return self._analyze_by_segments(
+                blocks, segments, _SEGMENT_STANDARD_SYSTEM_PROMPT, scenario_text
+            )
+        else:
+            return self._analyze_by_text_with_scenario(blocks, scenario_text)
+
+    # ── Сегментный режим ───────────────────────────────────────────────────────
+
+    def _analyze_by_segments(
+        self,
+        blocks: List[Dict],
+        segments: List[Dict],
+        system_prompt: str,
+        scenario_text: str = None,
+    ) -> List[Dict]:
+        """Основной режим: LLM видит сегменты, возвращает {"delete": [индексы]}."""
+        user_prompt = self._format_transcript_from_segments(segments)
+        if scenario_text:
+            user_prompt = (
+                f"СЦЕНАРИЙ:\n---\n{scenario_text.strip()}\n---\n\n" + user_prompt
+            )
+
+        log.info(f"LLM анализ (сегментный): {len(segments)} сегментов → {len(blocks)} блоков")
 
         last_error = None
         for attempt in range(config.LLM_MAX_RETRIES):
             try:
-                raw = self._call_api(_SYSTEM_PROMPT, user_prompt)
+                raw = self._call_api(system_prompt, user_prompt)
+                log.debug(f"LLM ответ: {raw[:500]}")
+                seg_delete = self._parse_segment_indices(raw)
+                log.info(f"LLM: удаляем сегменты {sorted(seg_delete)}")
+                delete_set = self._segments_to_block_indices(seg_delete, segments, blocks)
+                result = self._apply_decisions(blocks, delete_set)
+                kept = sum(1 for b in result if b["keep"])
+                log.info(f"LLM: оставлено {kept}/{len(result)} блоков")
+                return result
+            except Exception as e:
+                last_error = e
+                wait = 2 ** attempt
+                log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES}: {e}. Жду {wait}с...")
+                time.sleep(wait)
+
+        log.error(f"LLM не ответил: {last_error}. Оставляю все блоки.")
+        return self._apply_decisions(blocks, set())
+
+    def _format_transcript_from_segments(self, segments: List[Dict]) -> str:
+        """
+        Форматирует Whisper-сегменты для LLM.
+        Формат: [N] MM:SS --- текст сегмента
+        Совпадает с тем как пользователь отправляет транскрипцию вручную.
+        """
+        lines = [
+            f"Контекст видео: {config.VIDEO_CONTEXT}",
+            "",
+            "Проанализируй эту транскрипцию:",
+            "",
+        ]
+        for seg in segments:
+            text = seg.get("text", "").strip()
+            if not text:
+                continue
+            start = seg["start"]
+            m, s = divmod(int(start), 60)
+            ts = f"{m:02d}:{s:02d}"
+            lines.append(f"[{seg['index']}] {ts} --- {text}")
+        return "\n".join(lines)
+
+    def _parse_segment_indices(self, text: str) -> Set[int]:
+        """Парсит {"delete": [1, 3, 5]} → {1, 3, 5}."""
+        text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
+        text = re.sub(r"\s*```\s*$", "", text)
+
+        data = None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*"delete".*\}', text, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if data is None:
+            log.warning(f"Не удалось распарсить ответ LLM:\n{text[:500]}")
+            return set()
+
+        delete_list = data.get("delete", [])
+        if not isinstance(delete_list, list):
+            return set()
+
+        result = set()
+        for item in delete_list:
+            if isinstance(item, (int, float)):
+                result.add(int(item))
+        return result
+
+    def _segments_to_block_indices(
+        self, seg_delete: Set[int], segments: List[Dict], blocks: List[Dict]
+    ) -> Set[int]:
+        """
+        Маппит индексы удаляемых сегментов в индексы блоков.
+        Блок попадает в сегмент если его середина (mid) лежит в [seg.start, seg.end].
+        """
+        if not seg_delete:
+            return set()
+
+        deleted_segs = [s for s in segments if s["index"] in seg_delete]
+
+        delete_blocks: Set[int] = set()
+        for b in blocks:
+            mid = (b["start"] + b["end"]) / 2
+            for seg in deleted_segs:
+                if seg["start"] <= mid <= seg["end"]:
+                    delete_blocks.add(b["index"])
+                    break
+
+        return delete_blocks
+
+    # ── Текстовый режим (fallback) ─────────────────────────────────────────────
+
+    def _analyze_by_text(self, blocks: List[Dict], system_prompt: str) -> List[Dict]:
+        """Fallback: LLM видит блоки как текст, текстовое сопоставление."""
+        user_prompt = self._format_transcript(blocks)
+        log.info(f"LLM анализ (текстовый): {len(blocks)} блоков")
+
+        last_error = None
+        for attempt in range(config.LLM_MAX_RETRIES):
+            try:
+                raw = self._call_api(system_prompt, user_prompt)
                 log.debug(f"LLM ответ: {raw[:500]}")
                 delete_set = self._parse_and_match(raw, blocks)
                 result = self._apply_decisions(blocks, delete_set)
@@ -123,16 +319,14 @@ class LLMAnalyzer:
         log.error(f"LLM не ответил: {last_error}. Оставляю все блоки.")
         return self._apply_decisions(blocks, set())
 
-    def analyze_with_scenario(self, blocks: List[Dict], scenario_text: str) -> List[Dict]:
-        """Анализирует блоки зная текст сценария."""
-        if not blocks:
-            return []
-
+    def _analyze_by_text_with_scenario(
+        self, blocks: List[Dict], scenario_text: str
+    ) -> List[Dict]:
         user_prompt = (
             f"СЦЕНАРИЙ:\n---\n{scenario_text.strip()}\n---\n\n"
             + self._format_transcript(blocks)
         )
-        log.info(f"LLM (сценарий): {len(blocks)} блоков")
+        log.info(f"LLM (сценарий, текстовый): {len(blocks)} блоков")
 
         last_error = None
         for attempt in range(config.LLM_MAX_RETRIES):
@@ -155,13 +349,9 @@ class LLMAnalyzer:
         log.error(f"LLM не ответил: {last_error}. Оставляю все блоки.")
         return self._apply_decisions(blocks, set())
 
-    # ── Форматирование транскрипции ────────────────────────────────────────────
+    # ── Форматирование транскрипции (fallback) ─────────────────────────────────
 
     def _format_transcript(self, blocks: List[Dict]) -> str:
-        """
-        Формирует транскрипцию для LLM.
-        Блоки идут сплошным текстом — LLM читает как связный документ.
-        """
         lines = [
             f"Контекст видео: {config.VIDEO_CONTEXT}",
             "",
@@ -200,14 +390,9 @@ class LLMAnalyzer:
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
 
-    # ── Парсинг и сопоставление с блоками ─────────────────────────────────────
+    # ── Парсинг и сопоставление (fallback) ────────────────────────────────────
 
     def _parse_and_match(self, text: str, blocks: List[Dict]) -> Set[int]:
-        """
-        Парсит ответ LLM в формате {"repeats": [{"delete": "...", "keep": "..."}]},
-        сопоставляет текстовые фрагменты с блоками по словесному перекрытию.
-        """
-        # Чистим markdown-обёртки если есть
         text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
         text = re.sub(r"\s*```\s*$", "", text)
 
@@ -215,7 +400,6 @@ class LLMAnalyzer:
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            # Пробуем вырезать JSON из текста
             match = re.search(r'\{.*"repeats".*\}', text, re.DOTALL)
             if match:
                 try:
@@ -249,13 +433,6 @@ class LLMAnalyzer:
         return delete_set
 
     def _match_text_to_blocks(self, delete_text: str, blocks: List[Dict]) -> List[int]:
-        """
-        Находит блоки, текст которых совпадает с фрагментом для удаления.
-
-        Алгоритм: нормализуем текст (нижний регистр, без пунктуации),
-        считаем долю совпадающих слов. Порог 0.55 — достаточно строгий
-        чтобы не удалять лишнее, достаточно мягкий для незначительных расхождений.
-        """
         delete_norm = _normalize(delete_text)
         delete_words = set(delete_norm.split())
         if not delete_words:
@@ -268,10 +445,7 @@ class LLMAnalyzer:
             if not block_words:
                 continue
 
-            # Доля слов блока, присутствующих в delete-тексте
             overlap = len(block_words & delete_words) / len(block_words)
-
-            # Также проверяем через SequenceMatcher — ловит перефразировки
             seq_ratio = SequenceMatcher(None, block_norm, delete_norm).ratio()
 
             if overlap >= 0.55 or seq_ratio >= 0.70:
