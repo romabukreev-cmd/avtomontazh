@@ -186,6 +186,10 @@ class LLMAnalyzer:
 
     # ── Сегментный режим ───────────────────────────────────────────────────────
 
+    # Размер куска и перекрытие для чанковой обработки
+    _CHUNK_SIZE = 30   # сегментов на один запрос (~4 мин)
+    _CHUNK_OVERLAP = 5  # перекрытие между кусками (ловим повторы на границах)
+
     def _analyze_by_segments(
         self,
         blocks: List[Dict],
@@ -193,35 +197,53 @@ class LLMAnalyzer:
         system_prompt: str,
         scenario_text: str = None,
     ) -> List[Dict]:
-        """Основной режим: LLM видит сегменты, возвращает {"delete": [индексы]}."""
-        user_prompt = self._format_transcript_from_segments(segments)
-        if scenario_text:
-            user_prompt = (
-                f"СЦЕНАРИЙ:\n---\n{scenario_text.strip()}\n---\n\n" + user_prompt
-            )
+        """
+        Основной режим: чанковая обработка.
+        Делим сегменты на куски по ~30, обрабатываем каждый отдельно,
+        собираем все индексы на удаление.
+        """
+        step = self._CHUNK_SIZE - self._CHUNK_OVERLAP
+        chunks = []
+        for start in range(0, len(segments), step):
+            chunk = segments[start: start + self._CHUNK_SIZE]
+            if chunk:
+                chunks.append(chunk)
 
-        log.info(f"LLM анализ (сегментный): {len(segments)} сегментов → {len(blocks)} блоков")
+        log.info(
+            f"LLM анализ (сегментный, {len(chunks)} кусков): "
+            f"{len(segments)} сегментов → {len(blocks)} блоков"
+        )
 
-        last_error = None
-        for attempt in range(config.LLM_MAX_RETRIES):
-            try:
-                raw = self._call_api(system_prompt, user_prompt)
-                log.debug(f"LLM ответ: {raw[:500]}")
-                seg_delete = self._parse_segment_indices(raw)
-                log.info(f"LLM: удаляем сегменты {sorted(seg_delete)}")
-                delete_set = self._segments_to_block_indices(seg_delete, segments, blocks)
-                result = self._apply_decisions(blocks, delete_set)
-                kept = sum(1 for b in result if b["keep"])
-                log.info(f"LLM: оставлено {kept}/{len(result)} блоков")
-                return result
-            except Exception as e:
-                last_error = e
-                wait = 2 ** attempt
-                log.warning(f"Попытка {attempt+1}/{config.LLM_MAX_RETRIES}: {e}. Жду {wait}с...")
-                time.sleep(wait)
+        all_delete: Set[int] = set()
+        for i, chunk in enumerate(chunks):
+            user_prompt = self._format_transcript_from_segments(chunk)
+            if scenario_text:
+                user_prompt = (
+                    f"СЦЕНАРИЙ:\n---\n{scenario_text.strip()}\n---\n\n" + user_prompt
+                )
 
-        log.error(f"LLM не ответил: {last_error}. Оставляю все блоки.")
-        return self._apply_decisions(blocks, set())
+            last_error = None
+            for attempt in range(config.LLM_MAX_RETRIES):
+                try:
+                    raw = self._call_api(system_prompt, user_prompt)
+                    seg_delete = self._parse_segment_indices(raw)
+                    log.info(f"  Кусок {i+1}/{len(chunks)} (сег {chunk[0]['index']}–{chunk[-1]['index']}): удаляем {sorted(seg_delete)}")
+                    all_delete.update(seg_delete)
+                    break
+                except Exception as e:
+                    last_error = e
+                    wait = 2 ** attempt
+                    log.warning(f"  Кусок {i+1}, попытка {attempt+1}: {e}. Жду {wait}с...")
+                    time.sleep(wait)
+            else:
+                log.error(f"  Кусок {i+1}: LLM не ответил ({last_error}). Пропускаю.")
+
+        log.info(f"LLM итого: удаляем сегменты {sorted(all_delete)}")
+        delete_set = self._segments_to_block_indices(all_delete, segments, blocks)
+        result = self._apply_decisions(blocks, delete_set)
+        kept = sum(1 for b in result if b["keep"])
+        log.info(f"LLM: оставлено {kept}/{len(result)} блоков")
+        return result
 
     def _format_transcript_from_segments(self, segments: List[Dict]) -> str:
         """
