@@ -186,10 +186,6 @@ class LLMAnalyzer:
 
     # ── Сегментный режим ───────────────────────────────────────────────────────
 
-    # Размер куска и перекрытие для чанковой обработки
-    _CHUNK_SIZE = 30   # сегментов на один запрос (~4 мин)
-    _CHUNK_OVERLAP = 5  # перекрытие между кусками (ловим повторы на границах)
-
     def _analyze_by_segments(
         self,
         blocks: List[Dict],
@@ -197,48 +193,53 @@ class LLMAnalyzer:
         system_prompt: str,
         scenario_text: str = None,
     ) -> List[Dict]:
+        """Чанковая обработка: делит сегменты по ~30 (~4 мин) с перекрытием 5,
+        вызывает LLM для каждого чанка, объединяет результаты.
         """
-        Основной режим: чанковая обработка.
-        Делим сегменты на куски по ~30, обрабатываем каждый отдельно,
-        собираем все индексы на удаление.
-        """
-        step = self._CHUNK_SIZE - self._CHUNK_OVERLAP
-        chunks = []
-        for start in range(0, len(segments), step):
-            chunk = segments[start: start + self._CHUNK_SIZE]
-            if chunk:
-                chunks.append(chunk)
+        CHUNK_SIZE = 30
+        OVERLAP    = 5
+        STEP       = CHUNK_SIZE - OVERLAP
 
-        log.info(
-            f"LLM анализ (сегментный, {len(chunks)} кусков): "
-            f"{len(segments)} сегментов → {len(blocks)} блоков"
-        )
+        log.info(f"LLM анализ (сегментный): {len(segments)} сегментов -> {len(blocks)} блоков")
 
         all_delete: Set[int] = set()
-        for i, chunk in enumerate(chunks):
+        chunk_starts = list(range(0, len(segments), STEP))
+        total_chunks = len(chunk_starts)
+
+        for chunk_num, chunk_start in enumerate(chunk_starts):
+            chunk = segments[chunk_start:chunk_start + CHUNK_SIZE]
+            if not chunk:
+                continue
+
             user_prompt = self._format_transcript_from_segments(chunk)
             if scenario_text:
                 user_prompt = (
                     f"СЦЕНАРИЙ:\n---\n{scenario_text.strip()}\n---\n\n" + user_prompt
                 )
 
+            log.info(
+                f"LLM чанк {chunk_num+1}/{total_chunks}: "
+                f"сегменты [{chunk[0]['index']}]-[{chunk[-1]['index']}]"
+            )
+
             last_error = None
             for attempt in range(config.LLM_MAX_RETRIES):
                 try:
                     raw = self._call_api(system_prompt, user_prompt)
+                    log.debug(f"LLM ответ: {raw[:300]}")
                     seg_delete = self._parse_segment_indices(raw)
-                    log.info(f"  Кусок {i+1}/{len(chunks)} (сег {chunk[0]['index']}–{chunk[-1]['index']}): удаляем {sorted(seg_delete)}")
+                    log.info(f"  -> удаляем сегменты: {sorted(seg_delete)}")
                     all_delete.update(seg_delete)
                     break
                 except Exception as e:
                     last_error = e
                     wait = 2 ** attempt
-                    log.warning(f"  Кусок {i+1}, попытка {attempt+1}: {e}. Жду {wait}с...")
+                    log.warning(f"  Попытка {attempt+1}/{config.LLM_MAX_RETRIES}: {e}. Жду {wait}с...")
                     time.sleep(wait)
             else:
-                log.error(f"  Кусок {i+1}: LLM не ответил ({last_error}). Пропускаю.")
+                log.error(f"  Чанк {chunk_num+1} не обработан: {last_error}")
 
-        log.info(f"LLM итого: удаляем сегменты {sorted(all_delete)}")
+        log.info(f"LLM итого удаляем сегменты: {sorted(all_delete)}")
         delete_set = self._segments_to_block_indices(all_delete, segments, blocks)
         result = self._apply_decisions(blocks, delete_set)
         kept = sum(1 for b in result if b["keep"])

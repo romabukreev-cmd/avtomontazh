@@ -92,6 +92,24 @@ def _dedup_boundary_words(words: List[Dict]) -> List[Dict]:
     return result
 
 
+def _dedup_boundary_words(words: List[Dict]) -> List[Dict]:
+    """Убирает дубли слов на границах Whisper-сегментов.
+    Whisper иногда повторяет последнее слово сегмента в начале следующего.
+    """
+    if not words:
+        return words
+    result = [words[0]]
+    for w in words[1:]:
+        prev = result[-1]
+        prev_norm = prev["word"].strip().lower().strip(",.!?;:")
+        curr_norm = w["word"].strip().lower().strip(",.!?;:")
+        if prev_norm == curr_norm and w["start"] < prev["end"] + 1.0:
+            log.debug(f"dedup: пропускаем дубль слова {curr_norm!r} @{w['start']:.2f}с")
+            continue
+        result.append(w)
+    return result
+
+
 def _make_block(words: List[Dict], start_buf: float, end_buf: float) -> Dict:
     last       = words[-1]
     capped_end = min(last["end"], last["start"] + _MAX_WORD_DURATION)

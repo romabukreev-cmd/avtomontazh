@@ -186,9 +186,12 @@ class AutomontazhBot:
         msg = await update.message.reply_text("⏳ Синхронизирую с Google Drive...")
 
         try:
-            before = {s.name for s in self.session_manager.scan_sessions()}
+            _scan = (self.session_manager.scan_standard_sessions
+                     if self._mode == 'standard'
+                     else self.session_manager.scan_sessions)
+            before = {s.name for s in _scan()}
             await asyncio.to_thread(self._run_rclone_sync)
-            after_sessions = self.session_manager.scan_sessions()
+            after_sessions = _scan()
             after  = {s.name for s in after_sessions}
             new    = after - before
 
