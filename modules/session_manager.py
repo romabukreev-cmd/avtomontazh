@@ -19,7 +19,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import config
 
@@ -40,27 +40,6 @@ class Session:
 
     def __str__(self) -> str:
         return f"{self.name} ({self.file_count} файл{'а' if self.file_count in (2,3,4) else 'ов'})"
-
-
-@dataclass
-class StandardSession:
-    """Описание одной сессии записи (Стандартный: один поток видео 9:16)."""
-    name: str                          # имя папки, например "Reels 1"
-    path: Path                         # полный путь к папке сессии
-    video_files: List[Path]            # видеофайлы, отсортированные по имени
-    scenario_file: Optional[Path]      # путь к scenario.txt (None если нет)
-
-    @property
-    def file_count(self) -> int:
-        return len(self.video_files)
-
-    @property
-    def has_scenario(self) -> bool:
-        return self.scenario_file is not None
-
-    def __str__(self) -> str:
-        marker = " 📄" if self.has_scenario else ""
-        return f"{self.name} ({self.file_count} файл{'а' if self.file_count in (2,3,4) else 'ов'}){marker}"
 
 
 class SessionManager:
@@ -110,50 +89,6 @@ class SessionManager:
 
         log.info(f"Найдено {len(sessions)} сессий для обработки")
         return sessions
-
-    def scan_standard_sessions(self) -> List["StandardSession"]:
-        """
-        Сканирует input/ и возвращает список сессий для Стандартного сценария.
-        Стандартная сессия = папка с видеофайлами (любые имена) + опционально scenario.txt.
-        """
-        sessions = []
-
-        if not config.INPUT_DIR.exists():
-            return sessions
-
-        for session_dir in sorted(config.INPUT_DIR.iterdir()):
-            if not session_dir.is_dir():
-                continue
-
-            video_files = sorted(
-                [f for f in session_dir.iterdir()
-                 if f.suffix.lower() in config.VIDEO_EXTENSIONS],
-                key=lambda f: f.name,
-            )
-
-            if not video_files:
-                continue
-
-            if self.is_processed(session_dir.name):
-                continue
-
-            scenario_file = session_dir / config.STANDARD_SCENARIO_FILENAME
-            sessions.append(StandardSession(
-                name=session_dir.name,
-                path=session_dir,
-                video_files=video_files,
-                scenario_file=scenario_file if scenario_file.exists() else None,
-            ))
-
-        log.info(f"[Стандартный] Найдено {len(sessions)} сессий")
-        return sessions
-
-    def concat_standard_files(self, session: "StandardSession") -> Path:
-        """Склеивает видеофайлы стандартной сессии в один файл."""
-        if session.file_count == 1:
-            return session.video_files[0]
-        log.info(f"Конкатенация {session.file_count} файлов: {session.name}")
-        return self._concat(session.video_files, f"{session.name}_full")
 
     def is_processed(self, session_name: str) -> bool:
         """Сессия считается обработанной если в output/session_name/ есть хотя бы один .mp4."""

@@ -131,7 +131,7 @@ class Transcriber:
             hallucination_silence_threshold=2.0,  # не повторять текст в паузах > 2с
         )
 
-        result = []
+        raw = []
         for i, seg in enumerate(segments_gen):
             words = []
             for w in (seg.words or []):
@@ -147,19 +147,61 @@ class Transcriber:
             if not words and not text:
                 continue
 
-            result.append({
+            raw.append({
                 "index": i,
-                "start": round(float(seg.start), 3),
-                "end":   round(float(seg.end), 3),
                 "text":  text,
                 "words": words,
+                # точные границы вычислим после — с учётом соседних сегментов
+                "_seg_start": float(seg.start),
+                "_seg_end":   float(seg.end),
             })
 
+        result = _compute_boundaries(raw)
         log.info(f"Распознано сегментов: {len(result)}")
         return result
 
 
-# ── Утилита ────────────────────────────────────────────────────────────────────
+# ── Утилиты ────────────────────────────────────────────────────────────────────
+
+_MAX_WORD_DUR  = 1.5   # cap на длину слова (Whisper иногда раздувает)
+_BUF_START     = 0.05  # буфер перед первым словом
+_BUF_END       = 0.15  # буфер после последнего слова
+
+
+def _compute_boundaries(raw: list) -> list:
+    """
+    Вычисляет точные start/end каждого сегмента из word timestamps.
+    Гарантирует что сегменты не перекрываются.
+    """
+    result = []
+    for idx, seg in enumerate(raw):
+        words = seg["words"]
+        if words:
+            first = words[0]["start"]
+            last  = words[-1]
+            capped_end = min(last["end"], last["start"] + _MAX_WORD_DUR)
+            seg_start  = max(0.0, first - _BUF_START)
+            seg_end    = capped_end + _BUF_END
+        else:
+            # нет word timestamps — берём Whisper-границы
+            seg_start = max(0.0, seg["_seg_start"] - _BUF_START)
+            seg_end   = seg["_seg_end"] + _BUF_END
+
+        result.append({
+            "index": seg["index"],
+            "start": round(seg_start, 3),
+            "end":   round(seg_end,   3),
+            "text":  seg["text"],
+            "words": words,
+        })
+
+    # Клиппинг: сегмент не должен залезать в следующий
+    for i in range(len(result) - 1):
+        if result[i]["end"] > result[i+1]["start"]:
+            result[i]["end"] = round(result[i+1]["start"], 3)
+
+    return result
+
 
 def _dedup_consecutive(words: list) -> list:
     """

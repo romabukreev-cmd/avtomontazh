@@ -3,10 +3,9 @@ main.py — точка входа системы Автомонтаж.
 
 Пайплайн:
   1. Concat файлов сессии (если несколько частей)
-  2. Whisper транскрипция → слова с пословными таймстемпами
-  3. build_blocks() → речевые блоки (паузы >= 0.6с = границы блоков)
-  4. LLMAnalyzer.analyze() → маркирует повторы как keep=False
-  5. FFmpeg рендер → вертикальное видео 1080×1920
+  2. Whisper транскрипция → сегменты с пословными таймстемпами
+  3. LLMAnalyzer.analyze() → убирает повторы, возвращает kept_segments
+  4. FFmpeg рендер → вертикальное 1080×1920 + горизонтальное 1920×1080
 """
 
 import logging
@@ -14,14 +13,12 @@ import sys
 from typing import Callable
 
 import config
-from modules.bot               import AutomontazhBot
-from modules.session_manager   import Session, SessionManager, StandardSession
-from modules.transcriber       import Transcriber
-from modules.llm_analyzer      import LLMAnalyzer
-from modules.timeline          import build_blocks, total_duration
-from modules.renderer          import VideoRenderer
-from modules.standard_pipeline import process_standard_session
-from modules.utils             import setup_logging, ensure_dirs, format_duration
+from modules.bot             import AutomontazhBot
+from modules.session_manager import Session, SessionManager
+from modules.transcriber     import Transcriber
+from modules.llm_analyzer    import LLMAnalyzer
+from modules.renderer        import VideoRenderer
+from modules.utils           import setup_logging, ensure_dirs, format_duration
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -54,46 +51,37 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
         "<i>(несколько минут)</i>"
     )
     segments = transcriber.transcribe(screen_file)
+    total_speech = sum(s["end"] - s["start"] for s in segments)
+    log.info(f"Сегментов: {len(segments)}, суммарная речь: {format_duration(total_speech)}")
 
-    # ── Шаг 2: Речевые блоки ────────────────────────────────────────────────
-    # Разбиваем слова на блоки по паузам >= PAUSE_CUT_SEC.
-    # Блок = непрерывная речь. Паузы между блоками вырезаются автоматически.
-    blocks = build_blocks(segments)
-    total_speech = total_duration(blocks)
-    log.info(f"Блоков: {len(blocks)}, суммарная речь: {format_duration(total_speech)}")
-
-    # ── Шаг 3: LLM-анализ ───────────────────────────────────────────────────
-    # Отправляем все блоки в Claude одним запросом.
-    # Claude видит полный текст и находит смысловые повторы.
-    # Возвращает {"delete": [список индексов]} — блоки для удаления.
+    # ── Шаг 2: LLM-анализ ───────────────────────────────────────────────────
+    # Claude получает сегменты чанками по 30 (~4 минуты).
+    # Находит и удаляет смысловые повторы по всей длине видео.
     progress(
         f"▶ <b>{session.name}</b>\n\n"
         "✅ Файлы готовы\n"
-        f"✅ Транскрипция: {len(blocks)} блоков ({format_duration(total_speech)})\n"
+        f"✅ Транскрипция: {len(segments)} сегментов ({format_duration(total_speech)})\n"
         "⏳ AI анализирует повторы..."
     )
     analyzer = LLMAnalyzer()
-    scored_blocks = analyzer.analyze(blocks, segments)
-    kept = [b for b in scored_blocks if b["keep"]]
-    kept_duration = total_duration(kept)
-    log.info(f"После LLM: {len(kept)}/{len(scored_blocks)} блоков ({format_duration(kept_duration)})")
+    kept = analyzer.analyze(segments)
+    kept_duration = sum(s["end"] - s["start"] for s in kept)
+    log.info(f"После LLM: {len(kept)}/{len(segments)} сегментов ({format_duration(kept_duration)})")
 
-    # ── Шаг 4: Рендер ───────────────────────────────────────────────────────
-    # kept — список блоков с полями start/end.
-    # Это и есть финальный таймлайн: порядок соответствует оригиналу,
-    # паузы между блоками вырезаны, повторы удалены.
+    # ── Шаг 3: Рендер ───────────────────────────────────────────────────────
+    # kept — список сегментов с полями start/end — это и есть финальный таймлайн.
     output_dir = config.OUTPUT_DIR / session.name
     output_dir.mkdir(parents=True, exist_ok=True)
     renderer = VideoRenderer(screen_file, webcam_file, session.name)
 
-    def render_progress_fmt(label: str) -> Callable[[float], None]:
+    def render_progress(label: str) -> Callable[[float], None]:
         def _cb(pct: float) -> None:
             bar = "▓" * int(pct / 10) + "░" * (10 - int(pct / 10))
             progress(
                 f"▶ <b>{session.name}</b>\n\n"
                 "✅ Файлы готовы\n"
-                f"✅ Транскрипция: {len(blocks)} блоков ({format_duration(total_speech)})\n"
-                f"✅ AI: {len(kept)}/{len(scored_blocks)} блоков ({format_duration(kept_duration)})\n"
+                f"✅ Транскрипция: {len(segments)} сегментов ({format_duration(total_speech)})\n"
+                f"✅ AI: {len(kept)}/{len(segments)} сегментов ({format_duration(kept_duration)})\n"
                 f"⏳ Рендер {label}: [{bar}] {pct:.0f}%"
             )
         return _cb
@@ -101,24 +89,24 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
     renderer.render_vertical(
         kept, output_dir,
         output_filename="vertical_9min.mp4",
-        progress_callback=render_progress_fmt("9:16"),
+        progress_callback=render_progress("9:16"),
     )
     renderer.render_horizontal(
         kept, output_dir,
         output_filename="horizontal_9min.mp4",
-        progress_callback=render_progress_fmt("16:9"),
+        progress_callback=render_progress("16:9"),
     )
 
     progress(
         f"✅ <b>{session.name}</b>\n\n"
         "✅ Файлы готовы\n"
-        f"✅ Транскрипция: {len(blocks)} блоков ({format_duration(total_speech)})\n"
-        f"✅ AI: {len(kept)}/{len(scored_blocks)} блоков ({format_duration(kept_duration)})\n"
+        f"✅ Транскрипция: {len(segments)} сегментов ({format_duration(total_speech)})\n"
+        f"✅ AI: {len(kept)}/{len(segments)} сегментов ({format_duration(kept_duration)})\n"
         "✅ Рендер завершён (9:16 + 16:9)"
     )
     log.info(f"✅ Готово: {session.name}")
 
-    # ── Шаг 5: Уборка временных файлов ──────────────────────────────────────
+    # ── Шаг 4: Уборка временных файлов ──────────────────────────────────────
     if config.CLEANUP_TEMP_ON_SUCCESS:
         renderer.cleanup_temp()
         for temp_file in [screen_file, webcam_file]:
@@ -157,16 +145,10 @@ def main() -> None:
 
     transcriber = Transcriber()
 
-    def _auto_pipeline(session: Session, progress: Callable) -> None:
+    def _pipeline(session: Session, progress: Callable) -> None:
         process_session(session, progress, transcriber=transcriber)
 
-    def _standard_pipeline(session: StandardSession, progress: Callable) -> None:
-        process_standard_session(session, progress, transcriber=transcriber)
-
-    bot = AutomontazhBot(
-        auto_pipeline_fn=_auto_pipeline,
-        standard_pipeline_fn=_standard_pipeline,
-    )
+    bot = AutomontazhBot(pipeline_fn=_pipeline)
     bot.run()
 
 
