@@ -40,6 +40,7 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
         return []
 
     all_words.sort(key=lambda w: w["start"])
+    all_words = _dedup_boundary_words(all_words)
 
     thr       = config.PAUSE_THRESHOLD_SEC
     start_buf = config.BLOCK_START_BUFFER_SEC
@@ -69,6 +70,26 @@ def build_blocks(whisper_segments: List[Dict]) -> List[Dict]:
 def total_duration(blocks: List[Dict]) -> float:
     """Суммарная длительность kept-блоков в секундах."""
     return sum(b["end"] - b["start"] for b in blocks)
+
+
+def _dedup_boundary_words(words: List[Dict]) -> List[Dict]:
+    """
+    Удаляет слова-дубли на границах Whisper-сегментов.
+    Whisper иногда записывает последнее слово сегмента 1 как первое слово сегмента 2.
+    Критерий: то же слово (без пунктуации, без учёта регистра) в пределах 1.5с.
+    """
+    if len(words) < 2:
+        return words
+    result = [words[0]]
+    for w in words[1:]:
+        prev = result[-1]
+        prev_clean = prev["word"].strip().lower().strip(".,!?;:-—«»")
+        curr_clean = w["word"].strip().lower().strip(".,!?;:-—«»")
+        if prev_clean and curr_clean == prev_clean and w["start"] - prev["end"] < 1.5:
+            log.debug(f"Dedup boundary: '{w['word']}' @ {w['start']:.2f}s (дубль с {prev['start']:.2f}s)")
+            continue
+        result.append(w)
+    return result
 
 
 def _make_block(words: List[Dict], start_buf: float, end_buf: float) -> Dict:
