@@ -573,9 +573,19 @@ class AutomontazhBot:
         count = len(folders)
         for d in folders:
             shutil.rmtree(d)
-            log.info(f"clear_output: удалена папка {d.name}")
+            log.info(f"clear_output: удалена локальная папка {d.name}")
+            # Удаляем с Google Drive
+            remote_path = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}/{d.name}"
+            result = subprocess.run(
+                ["rclone", "purge", remote_path],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                log.info(f"clear_output: удалено с GDrive {d.name}")
+            else:
+                log.warning(f"clear_output: GDrive purge не удался для {d.name}: {result.stderr[:200]}")
 
-        await query.edit_message_text(f"✅ Удалено {count} сессий из output.")
+        await query.edit_message_text(f"✅ Удалено {count} сессий (сервер + Google Drive).")
 
     def _run_rclone_sync(self) -> None:
         remote_path = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_INPUT_PATH}"
