@@ -78,12 +78,14 @@ def _split_on_pauses(segments: List[Dict]) -> List[Dict]:
         groups.append(current_group)
 
         # Создаём под-сегмент для каждой группы
+        seg_start = seg["start"]
+        seg_end   = seg["end"]
         for group in groups:
             first = group[0]
             last  = group[-1]
             capped_end = min(last["end"], last["start"] + config.MAX_WORD_DUR)
-            sub_start  = max(0.0, first["start"] - config.SEG_BUF_START)
-            sub_end    = capped_end + config.SEG_BUF_END
+            sub_start  = max(seg_start, first["start"] - config.SEG_BUF_START)
+            sub_end    = min(seg_end,   capped_end + config.SEG_BUF_END)
             text       = " ".join(w["word"].strip() for w in group)
             result.append({
                 "start": round(sub_start, 3),
