@@ -65,6 +65,13 @@ def _split_on_pauses(segments: list, pause_sec: float) -> list:
                 "words": group,
             })
 
+    # Клиппинг: блоки не должны перекрываться.
+    # _split_on_pauses пересчитывает start/end с буферами и может создать
+    # перекрытие на границах соседних сегментов → одно слово слышно дважды.
+    for i in range(len(result) - 1):
+        if result[i]["end"] > result[i + 1]["start"]:
+            result[i]["end"] = result[i + 1]["start"]
+
     return result
 
 
