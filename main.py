@@ -4,8 +4,9 @@ main.py — точка входа системы Автомонтаж.
 Пайплайн:
   1. Concat файлов сессии (если несколько частей)
   2. Whisper транскрипция → сегменты с пословными таймстемпами
-  3. LLMAnalyzer.analyze() → убирает повторы, возвращает kept_segments
-  4. FFmpeg рендер → вертикальное 1080×1920 + горизонтальное 1920×1080
+  3. LLMAnalyzer.analyze() → убирает смысловые повторы
+  4. _split_on_pauses() → разбивает сегменты по межсловным паузам (удаляет тишину)
+  5. FFmpeg рендер → вертикальное 1080×1920 + горизонтальное 1920×1080
 """
 
 import logging
@@ -19,6 +20,52 @@ from modules.transcriber     import Transcriber
 from modules.llm_analyzer    import LLMAnalyzer
 from modules.renderer        import VideoRenderer
 from modules.utils           import setup_logging, ensure_dirs, format_duration
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  УТИЛИТЫ
+# ══════════════════════════════════════════════════════════════════════════════
+
+_BUF_START = 0.05
+_BUF_END   = 0.15
+_MAX_WORD_DUR = 1.5
+
+
+def _split_on_pauses(segments: list, pause_sec: float) -> list:
+    """
+    Разбивает каждый сегмент на под-сегменты по межсловным паузам.
+    Пауза между словами >= pause_sec → граница нового под-сегмента.
+    Удаляет тишину внутри речевых сегментов без изменения логики LLM.
+    """
+    result = []
+    for seg in segments:
+        words = seg.get("words", [])
+        if not words:
+            result.append(seg)
+            continue
+
+        groups = [[words[0]]]
+        for word in words[1:]:
+            gap = word["start"] - groups[-1][-1]["end"]
+            if gap >= pause_sec:
+                groups.append([word])
+            else:
+                groups[-1].append(word)
+
+        for group in groups:
+            first = group[0]["start"]
+            last  = group[-1]
+            seg_start = round(max(0.0, first - _BUF_START), 3)
+            seg_end   = round(min(last["end"], last["start"] + _MAX_WORD_DUR) + _BUF_END, 3)
+            result.append({
+                "index": seg["index"],
+                "start": seg_start,
+                "end":   seg_end,
+                "text":  " ".join(w["word"] for w in group),
+                "words": group,
+            })
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -68,8 +115,13 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
     kept_duration = sum(s["end"] - s["start"] for s in kept)
     log.info(f"После LLM: {len(kept)}/{len(segments)} сегментов ({format_duration(kept_duration)})")
 
+    # ── Шаг 2.5: Разбивка по паузам ─────────────────────────────────────────
+    # Режем тишину внутри kept-сегментов по word timestamps.
+    timeline = _split_on_pauses(kept, config.PAUSE_CUT_SEC)
+    timeline_duration = sum(s["end"] - s["start"] for s in timeline)
+    log.info(f"После пауз: {len(timeline)} под-сегментов ({format_duration(timeline_duration)})")
+
     # ── Шаг 3: Рендер ───────────────────────────────────────────────────────
-    # kept — список сегментов с полями start/end — это и есть финальный таймлайн.
     output_dir = config.OUTPUT_DIR / session.name
     output_dir.mkdir(parents=True, exist_ok=True)
     renderer = VideoRenderer(screen_file, webcam_file, session.name)
@@ -82,17 +134,18 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
                 "✅ Файлы готовы\n"
                 f"✅ Транскрипция: {len(segments)} сегментов ({format_duration(total_speech)})\n"
                 f"✅ AI: {len(kept)}/{len(segments)} сегментов ({format_duration(kept_duration)})\n"
+                f"✅ Паузы вырезаны: {format_duration(timeline_duration)}\n"
                 f"⏳ Рендер {label}: [{bar}] {pct:.0f}%"
             )
         return _cb
 
     renderer.render_vertical(
-        kept, output_dir,
+        timeline, output_dir,
         output_filename="vertical_9min.mp4",
         progress_callback=render_progress("9:16"),
     )
     renderer.render_horizontal(
-        kept, output_dir,
+        timeline, output_dir,
         output_filename="horizontal_9min.mp4",
         progress_callback=render_progress("16:9"),
     )
@@ -102,6 +155,7 @@ def process_session(session: Session, progress: Callable, transcriber: Transcrib
         "✅ Файлы готовы\n"
         f"✅ Транскрипция: {len(segments)} сегментов ({format_duration(total_speech)})\n"
         f"✅ AI: {len(kept)}/{len(segments)} сегментов ({format_duration(kept_duration)})\n"
+        f"✅ Паузы вырезаны: {format_duration(timeline_duration)}\n"
         "✅ Рендер завершён (9:16 + 16:9)"
     )
     log.info(f"✅ Готово: {session.name}")
