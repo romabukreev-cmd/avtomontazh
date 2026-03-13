@@ -26,9 +26,9 @@ from modules.utils           import setup_logging, ensure_dirs, format_duration
 #  УТИЛИТЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
-_BUF_START = 0.05
-_BUF_END   = 0.15
-_MAX_WORD_DUR = 1.5
+_BUF_START    = config.SEG_BUF_START
+_BUF_END      = config.SEG_BUF_END
+_MAX_WORD_DUR = config.MAX_WORD_DUR
 
 
 def _split_on_pauses(segments: list, pause_sec: float) -> list:

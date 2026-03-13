@@ -163,9 +163,9 @@ class Transcriber:
 
 # ── Утилиты ────────────────────────────────────────────────────────────────────
 
-_MAX_WORD_DUR  = 1.5   # cap на длину слова (Whisper иногда раздувает)
-_BUF_START     = 0.05  # буфер перед первым словом
-_BUF_END       = 0.15  # буфер после последнего слова
+_MAX_WORD_DUR  = config.MAX_WORD_DUR   # cap на длину слова (Whisper иногда раздувает)
+_BUF_START     = config.SEG_BUF_START  # буфер перед первым словом
+_BUF_END       = config.SEG_BUF_END    # буфер после последнего слова
 
 
 def _compute_boundaries(raw: list) -> list:
