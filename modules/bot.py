@@ -382,7 +382,9 @@ class AutomontazhBot:
             await query.edit_message_text("Папка output уже пуста.")
             return
         folders = sorted(d for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
-        count = len(folders)
+        count       = len(folders)
+        gdrive_ok   = []
+        gdrive_fail = []
         for d in folders:
             shutil.rmtree(d)
             log.info(f"clear_output: удалена локальная папка {d.name}")
@@ -390,9 +392,21 @@ class AutomontazhBot:
             result = subprocess.run(["rclone", "purge", remote], capture_output=True, text=True)
             if result.returncode == 0:
                 log.info(f"clear_output: удалено с GDrive {d.name}")
+                gdrive_ok.append(d.name)
             else:
-                log.warning(f"clear_output: GDrive purge не удался для {d.name}: {result.stderr[:200]}")
-        await query.edit_message_text(f"✅ Удалено {count} сессий (сервер + Google Drive).")
+                log.warning(f"clear_output: GDrive purge не удался для {d.name}: {result.stderr[:500]}")
+                gdrive_fail.append(d.name)
+
+        if gdrive_fail:
+            fail_list = "\n".join(f"  • {n}" for n in gdrive_fail)
+            await query.edit_message_text(
+                f"✅ Удалено локально: {count} сессий.\n\n"
+                f"❌ Не удалось удалить с Google Drive:\n{fail_list}\n\n"
+                "Проверь логи сервера.",
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text(f"✅ Удалено {count} сессий (сервер + Google Drive).")
 
     # ── Пайплайн ──────────────────────────────────────────────────────────────
 
