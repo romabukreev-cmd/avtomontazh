@@ -268,24 +268,14 @@ class AutomontazhBot:
                 parse_mode="HTML",
             )
             return
-        # Локальные папки
-        local_folders = []
-        if config.OUTPUT_DIR.exists():
-            local_folders = sorted(d.name for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
 
-        # Папки на Google Drive
-        remote = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}"
-        res = subprocess.run(
-            ["rclone", "lsf", "--dirs-only", remote],
-            capture_output=True, text=True,
-        )
-        gdrive_folders = sorted(
-            name.rstrip("/") for name in res.stdout.splitlines() if name.strip()
-        ) if res.returncode == 0 else []
+        msg = await update.message.reply_text("⏳ Проверяю output...")
+
+        local_folders, gdrive_folders = await asyncio.to_thread(self._list_output_folders)
 
         all_names = sorted(set(local_folders) | set(gdrive_folders))
         if not all_names:
-            await update.message.reply_text("Папка output пуста (сервер и Google Drive).")
+            await msg.edit_text("Папка output пуста (сервер и Google Drive).")
             return
 
         lines = []
@@ -297,7 +287,7 @@ class AutomontazhBot:
                 tags.append("GDrive")
             lines.append(f"  • {name} ({', '.join(tags)})")
 
-        await update.message.reply_text(
+        await msg.edit_text(
             f"Будет удалено ({len(all_names)} сессий):\n" + "\n".join(lines) + "\n\nПодтверждаешь?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🗑 Да, удалить всё", callback_data="clear_output_confirm"),
@@ -399,41 +389,10 @@ class AutomontazhBot:
         await query.answer()
         if not self._allowed(update):
             return
-        if not config.OUTPUT_DIR.exists():
-            await query.edit_message_text("Папка output уже пуста.")
-            return
-        # Собираем все имена: локальные + GDrive
-        local_folders = []
-        if config.OUTPUT_DIR.exists():
-            local_folders = [d for d in config.OUTPUT_DIR.iterdir() if d.is_dir()]
 
-        remote_base = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}"
-        res = subprocess.run(
-            ["rclone", "lsf", "--dirs-only", remote_base],
-            capture_output=True, text=True,
-        )
-        gdrive_names = set(
-            name.rstrip("/") for name in res.stdout.splitlines() if name.strip()
-        ) if res.returncode == 0 else set()
+        await query.edit_message_text("⏳ Удаляю...")
 
-        all_names = sorted(set(d.name for d in local_folders) | gdrive_names)
-        count = len(all_names)
-
-        # Удаляем локально
-        for d in local_folders:
-            shutil.rmtree(d)
-            log.info(f"clear_output: удалена локальная папка {d.name}")
-
-        # Удаляем с GDrive
-        gdrive_fail = []
-        for name in all_names:
-            remote = f"{remote_base}/{name}"
-            result = subprocess.run(["rclone", "purge", remote], capture_output=True, text=True)
-            if result.returncode == 0:
-                log.info(f"clear_output: удалено с GDrive {name}")
-            else:
-                log.warning(f"clear_output: GDrive purge не удался для {name}: {result.stderr[:500]}")
-                gdrive_fail.append(name)
+        count, gdrive_fail = await asyncio.to_thread(self._delete_all_output)
 
         if gdrive_fail:
             fail_list = "\n".join(f"  • {n}" for n in gdrive_fail)
@@ -544,3 +503,45 @@ class AutomontazhBot:
         if inp.exists():
             shutil.rmtree(inp)
             log.info(f"Удалена входная папка: {inp}")
+
+    def _list_output_folders(self) -> tuple[list[str], list[str]]:
+        """Возвращает (local_folders, gdrive_folders) — имена папок в output."""
+        local_folders = []
+        if config.OUTPUT_DIR.exists():
+            local_folders = sorted(d.name for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
+
+        remote = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}"
+        res = subprocess.run(["rclone", "lsf", "--dirs-only", remote], capture_output=True, text=True)
+        gdrive_folders = sorted(
+            name.rstrip("/") for name in res.stdout.splitlines() if name.strip()
+        ) if res.returncode == 0 else []
+
+        return local_folders, gdrive_folders
+
+    def _delete_all_output(self) -> tuple[int, list[str]]:
+        """Удаляет все папки из output локально и на GDrive. Возвращает (count, gdrive_fail)."""
+        local_folders, gdrive_folders = self._list_output_folders()
+
+        local_dirs = []
+        if config.OUTPUT_DIR.exists():
+            local_dirs = [d for d in config.OUTPUT_DIR.iterdir() if d.is_dir()]
+
+        all_names = sorted(set(d.name for d in local_dirs) | set(gdrive_folders))
+        count = len(all_names)
+
+        for d in local_dirs:
+            shutil.rmtree(d)
+            log.info(f"clear_output: удалена локальная папка {d.name}")
+
+        remote_base = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}"
+        gdrive_fail = []
+        for name in all_names:
+            remote = f"{remote_base}/{name}"
+            result = subprocess.run(["rclone", "purge", remote], capture_output=True, text=True)
+            if result.returncode == 0:
+                log.info(f"clear_output: удалено с GDrive {name}")
+            else:
+                log.warning(f"clear_output: GDrive purge не удался для {name}: {result.stderr[:500]}")
+                gdrive_fail.append(name)
+
+        return count, gdrive_fail
