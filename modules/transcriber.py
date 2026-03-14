@@ -159,16 +159,25 @@ def _compute_boundaries(raw: List[Dict]) -> List[Dict]:
     # Клиппинг: сегмент N не должен перекрывать сегмент N+1
     for i in range(len(result) - 1):
         if result[i]["end"] > result[i + 1]["start"]:
-            clip   = result[i + 1]["start"]
-            words_i = result[i]["words"]
+            clip    = result[i + 1]["start"]
+            words_i = list(result[i]["words"])
 
-            if words_i:
-                last = words_i[-1]
-                # Если clip попадает внутрь последнего слова — откатываем до его начала
-                if last["start"] <= clip <= last["end"]:
-                    clip = max(0.0, last["start"] - 0.01)
-                    result[i]["words"] = words_i[:-1]  # слово уйдёт в следующий сегмент
+            # Итеративно убираем слова с конца, пока не найдём слово,
+            # которое полностью заканчивается до clip.
+            # Простая проверка только последнего слова не достаточна:
+            # clip может попасть в середину предпоследнего слова, если
+            # последнее слово начинается позже clip.
+            while words_i:
+                last_w = words_i[-1]
+                if last_w["start"] >= clip:
+                    words_i.pop()          # слово начинается после clip — убрать
+                elif last_w["end"] > clip:
+                    words_i.pop()          # слово пересекает clip — убрать, откатить clip
+                    clip = max(result[i]["start"], last_w["start"] - 0.01)
+                else:
+                    break                  # слово полностью до clip — чисто
 
-            result[i]["end"] = max(result[i]["start"], round(clip, 3))
+            result[i]["words"] = words_i
+            result[i]["end"]   = max(result[i]["start"], round(clip, 3))
 
     return result
