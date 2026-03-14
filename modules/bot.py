@@ -268,16 +268,37 @@ class AutomontazhBot:
                 parse_mode="HTML",
             )
             return
-        if not config.OUTPUT_DIR.exists():
-            await update.message.reply_text("Папка output пуста.")
+        # Локальные папки
+        local_folders = []
+        if config.OUTPUT_DIR.exists():
+            local_folders = sorted(d.name for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
+
+        # Папки на Google Drive
+        remote = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}"
+        res = subprocess.run(
+            ["rclone", "lsf", "--dirs-only", remote],
+            capture_output=True, text=True,
+        )
+        gdrive_folders = sorted(
+            name.rstrip("/") for name in res.stdout.splitlines() if name.strip()
+        ) if res.returncode == 0 else []
+
+        all_names = sorted(set(local_folders) | set(gdrive_folders))
+        if not all_names:
+            await update.message.reply_text("Папка output пуста (сервер и Google Drive).")
             return
-        folders = sorted(d for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
-        if not folders:
-            await update.message.reply_text("Папка output пуста.")
-            return
-        names = "\n".join(f"  • {d.name}" for d in folders)
+
+        lines = []
+        for name in all_names:
+            tags = []
+            if name in local_folders:
+                tags.append("сервер")
+            if name in gdrive_folders:
+                tags.append("GDrive")
+            lines.append(f"  • {name} ({', '.join(tags)})")
+
         await update.message.reply_text(
-            f"Будет удалено ({len(folders)} сессий):\n{names}\n\nПодтверждаешь?",
+            f"Будет удалено ({len(all_names)} сессий):\n" + "\n".join(lines) + "\n\nПодтверждаешь?",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🗑 Да, удалить всё", callback_data="clear_output_confirm"),
                 InlineKeyboardButton("Отмена",             callback_data="clear_output_cancel"),
@@ -381,21 +402,38 @@ class AutomontazhBot:
         if not config.OUTPUT_DIR.exists():
             await query.edit_message_text("Папка output уже пуста.")
             return
-        folders = sorted(d for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
-        count       = len(folders)
-        gdrive_ok   = []
-        gdrive_fail = []
-        for d in folders:
+        # Собираем все имена: локальные + GDrive
+        local_folders = []
+        if config.OUTPUT_DIR.exists():
+            local_folders = [d for d in config.OUTPUT_DIR.iterdir() if d.is_dir()]
+
+        remote_base = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}"
+        res = subprocess.run(
+            ["rclone", "lsf", "--dirs-only", remote_base],
+            capture_output=True, text=True,
+        )
+        gdrive_names = set(
+            name.rstrip("/") for name in res.stdout.splitlines() if name.strip()
+        ) if res.returncode == 0 else set()
+
+        all_names = sorted(set(d.name for d in local_folders) | gdrive_names)
+        count = len(all_names)
+
+        # Удаляем локально
+        for d in local_folders:
             shutil.rmtree(d)
             log.info(f"clear_output: удалена локальная папка {d.name}")
-            remote = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}/{d.name}"
+
+        # Удаляем с GDrive
+        gdrive_fail = []
+        for name in all_names:
+            remote = f"{remote_base}/{name}"
             result = subprocess.run(["rclone", "purge", remote], capture_output=True, text=True)
             if result.returncode == 0:
-                log.info(f"clear_output: удалено с GDrive {d.name}")
-                gdrive_ok.append(d.name)
+                log.info(f"clear_output: удалено с GDrive {name}")
             else:
-                log.warning(f"clear_output: GDrive purge не удался для {d.name}: {result.stderr[:500]}")
-                gdrive_fail.append(d.name)
+                log.warning(f"clear_output: GDrive purge не удался для {name}: {result.stderr[:500]}")
+                gdrive_fail.append(name)
 
         if gdrive_fail:
             fail_list = "\n".join(f"  • {n}" for n in gdrive_fail)
