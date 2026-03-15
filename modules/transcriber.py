@@ -123,31 +123,18 @@ def _dedup_consecutive(words: List[Dict]) -> List[Dict]:
 
 def _compute_boundaries(raw: List[Dict]) -> List[Dict]:
     """
-    Вычисляет точные start/end каждого сегмента из word timestamps.
-
-    Формула границ:
-        start = first_word.start - SEG_BUF_START
-        end   = min(last_word.end, last_word.start + MAX_WORD_DUR) + SEG_BUF_END
-
-    Клиппинг (seg[N].end не должен заходить в seg[N+1].start):
-        Если точка обрезки попадает ВНУТРЬ последнего слова →
-        откатываем до начала этого слова (иначе слово слышно дважды — заикание).
-        При откате также удаляем это слово из списка words сегмента N,
-        чтобы оно не дублировалось при последующей обработке.
+    Форматирует сегменты из Whisper.
+    Использует нативные timestamps без изменений — Whisper достаточно точен.
     """
     result = []
-    for idx, seg in enumerate(raw):
+    for seg in raw:
         words = seg["words"]
         if words:
-            first = words[0]
-            last  = words[-1]
-            capped_end = min(last["end"], last["start"] + config.MAX_WORD_DUR)
-            seg_start  = max(0.0, first["start"] - config.SEG_BUF_START)
-            seg_end    = capped_end + config.SEG_BUF_END
+            seg_start = words[0]["start"]
+            seg_end   = words[-1]["end"]
         else:
-            seg_start = max(0.0, seg["_seg_start"] - config.SEG_BUF_START)
-            seg_end   = seg["_seg_end"] + config.SEG_BUF_END
-
+            seg_start = seg["_seg_start"]
+            seg_end   = seg["_seg_end"]
         result.append({
             "index": seg["index"],
             "start": round(seg_start, 3),
@@ -155,29 +142,4 @@ def _compute_boundaries(raw: List[Dict]) -> List[Dict]:
             "text":  seg["text"],
             "words": words,
         })
-
-    # Клиппинг: сегмент N не должен перекрывать сегмент N+1
-    for i in range(len(result) - 1):
-        if result[i]["end"] > result[i + 1]["start"]:
-            clip    = result[i + 1]["start"]
-            words_i = list(result[i]["words"])
-
-            # Итеративно убираем слова с конца, пока не найдём слово,
-            # которое полностью заканчивается до clip.
-            # Простая проверка только последнего слова не достаточна:
-            # clip может попасть в середину предпоследнего слова, если
-            # последнее слово начинается позже clip.
-            while words_i:
-                last_w = words_i[-1]
-                if last_w["start"] >= clip:
-                    words_i.pop()          # слово начинается после clip — убрать
-                elif last_w["end"] > clip:
-                    words_i.pop()          # слово пересекает clip — убрать, откатить clip
-                    clip = max(result[i]["start"], last_w["start"] - 0.01)
-                else:
-                    break                  # слово полностью до clip — чисто
-
-            result[i]["words"] = words_i
-            result[i]["end"]   = max(result[i]["start"], round(clip, 3))
-
     return result

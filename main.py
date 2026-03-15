@@ -5,7 +5,7 @@ main.py — точка входа системы Автомонтаж.
   1. concat_files()    — склеить части сессии
   2. transcribe()      — Whisper → sentence-level сегменты с word timestamps
   3. analyze()         — LLM чанками → kept_segments (удалены смысловые повторы)
-  4. _split_on_pauses() — удалить тишину внутри kept-сегментов → timeline
+  4. _build_timeline()  — удалить паузы внутри kept-сегментов → timeline
   5. render_vertical()  — FFmpeg → vertical_9min.mp4
   6. render_horizontal() — FFmpeg → horizontal_9min.mp4
 """
@@ -37,82 +37,47 @@ renderer        = VideoRenderer()
 
 # ── Разбивка по паузам ────────────────────────────────────────────────────────
 
-def _split_on_pauses(segments: List[Dict]) -> List[Dict]:
+def _build_timeline(segments: List[Dict]) -> List[Dict]:
     """
-    Разбивает kept-сегменты на под-сегменты, удаляя паузы >= PAUSE_CUT_SEC.
-
-    Для каждого сегмента берём word timestamps, ищем межсловные паузы.
-    Если пауза >= порога — это граница нового под-сегмента.
-
-    Границы под-сегмента:
-        start = first_word.start - SEG_BUF_START
-        end   = min(last_word.end, last_word.start + MAX_WORD_DUR) + SEG_BUF_END
-
-    Финальный клиппинг: следующий под-сегмент не должен перекрывать предыдущий.
-    Если clip попадает внутрь последнего слова — откатываем до начала этого слова.
+    Строит timeline из kept-сегментов:
+    1. Режет паузы >= PAUSE_CUT_SEC между словами
+    2. Добавляет маленький буфер вокруг каждого блока слов
+    3. Сортирует по времени и мёрджит пересечения — гарантирует корректный порядок
     """
-    result = []
+    intervals: List[List[float]] = []
 
     for seg in segments:
         words = seg.get("words", [])
         if not words:
-            # Нет word timestamps — оставляем сегмент как есть
-            result.append({
-                "start": seg["start"],
-                "end":   seg["end"],
-                "text":  seg.get("text", ""),
-                "words": [],
-            })
+            intervals.append([seg["start"], seg["end"]])
             continue
 
         # Группируем слова по паузам
-        groups: List[List[Dict]] = []
-        current_group = [words[0]]
+        g_start = words[0]["start"]
+        g_end   = words[0]["end"]
         for w in words[1:]:
-            gap = w["start"] - current_group[-1]["end"]
-            if gap >= config.PAUSE_CUT_SEC:
-                groups.append(current_group)
-                current_group = [w]
-            else:
-                current_group.append(w)
-        groups.append(current_group)
+            if w["start"] - g_end >= config.PAUSE_CUT_SEC:
+                intervals.append([g_start, g_end])
+                g_start = w["start"]
+            g_end = w["end"]
+        intervals.append([g_start, g_end])
 
-        # Создаём под-сегмент для каждой группы
-        seg_start = seg["start"]
-        seg_end   = seg["end"]
-        for group in groups:
-            first = group[0]
-            last  = group[-1]
-            capped_end = min(last["end"], last["start"] + config.MAX_WORD_DUR)
-            sub_start  = max(seg_start, first["start"] - config.SEG_BUF_START)
-            sub_end    = min(seg_end,   capped_end + config.SEG_BUF_END)
-            text       = " ".join(w["word"].strip() for w in group)
-            result.append({
-                "start": round(sub_start, 3),
-                "end":   round(sub_end,   3),
-                "text":  text,
-                "words": group,
-            })
+    if not intervals:
+        return []
 
-    # Клиппинг: под-сегмент N не должен перекрывать под-сегмент N+1
-    for i in range(len(result) - 1):
-        if result[i]["end"] > result[i + 1]["start"]:
-            clip    = result[i + 1]["start"]
-            words_i = result[i].get("words", [])
+    # Маленький буфер: 50мс до, 100мс после каждого блока
+    padded = [[max(0.0, s - 0.05), e + 0.1] for s, e in intervals]
 
-            if words_i:
-                last = words_i[-1]
-                # Если clip попадает внутрь последнего слова — откатываем до его начала
-                if last["start"] <= clip <= last["end"]:
-                    clip = max(0.0, last["start"] - 0.01)
-                    result[i]["words"] = words_i[:-1]
+    # Сортировка + merge пересекающихся интервалов
+    padded.sort(key=lambda x: x[0])
+    merged = [padded[0][:]]
+    for s, e in padded[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
 
-            result[i]["end"] = max(result[i]["start"], round(clip, 3))
-
-    # Убираем под-сегменты нулевой или отрицательной длины
-    result = [s for s in result if s["end"] > s["start"]]
-
-    return result
+    return [{"start": round(s, 3), "end": round(e, 3)} for s, e in merged]
 
 
 # ── Пайплайн ──────────────────────────────────────────────────────────────────
@@ -149,7 +114,7 @@ def _pipeline(session: Session, progress: Callable[[str], None]) -> None:
     done(f"✅ AI: {len(kept)}/{len(segments)} сегментов ({format_duration(kept_dur)})")
 
     # 4. Удаление пауз
-    timeline = _split_on_pauses(kept)
+    timeline = _build_timeline(kept)
     tl_dur   = sum(s["end"] - s["start"] for s in timeline)
     done(f"✅ Паузы вырезаны: {format_duration(tl_dur)}")
 
