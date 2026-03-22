@@ -38,11 +38,10 @@ class VideoRenderer:
         """
         output_path = output_dir / "vertical_9min.mp4"
         total_dur   = sum(s["end"] - s["start"] for s in timeline)
-        fade_out    = max(0.0, total_dur - 0.5)
         crop_y      = config.SCREEN_CROP_Y
 
         fc = _build_filter_complex(timeline, mode="vertical",
-                                   crop_y=crop_y, fade_out=fade_out,
+                                   crop_y=crop_y,
                                    pip_w=0, pip_h=0, pip_mr=0, pip_mb=0)
         cmd = _build_cmd(screen_file, webcam_file, fc, output_path)
 
@@ -65,11 +64,10 @@ class VideoRenderer:
         """
         output_path = output_dir / "horizontal_9min.mp4"
         total_dur   = sum(s["end"] - s["start"] for s in timeline)
-        fade_out    = max(0.0, total_dur - 0.5)
         crop_y      = config.SCREEN_CROP_Y
 
         fc = _build_filter_complex(timeline, mode="horizontal",
-                                   crop_y=crop_y, fade_out=fade_out,
+                                   crop_y=crop_y,
                                    pip_w=config.PIP_WIDTH, pip_h=config.PIP_HEIGHT,
                                    pip_mr=config.PIP_MARGIN_RIGHT,
                                    pip_mb=config.PIP_MARGIN_BOTTOM)
@@ -86,7 +84,6 @@ def _build_filter_complex(
     timeline: List[Dict],
     mode:     str,       # "vertical" или "horizontal"
     crop_y:   int,
-    fade_out: float,
     pip_w:    int,
     pip_h:    int,
     pip_mr:   int,
@@ -101,7 +98,7 @@ def _build_filter_complex(
         [0:a]atrim=start=S:end=E,asetpts=PTS-STARTPTS[sa{i}]
 
     Затем concat всех видео- и аудио-потоков.
-    Затем компоновка (vstack или overlay) и fade аудио.
+    Затем компоновка (vstack или overlay).
     """
     parts       = []
     sv_labels   = []   # screen video per segment
@@ -136,11 +133,8 @@ def _build_filter_complex(
         parts.append(f"[webcam_concat]crop=1080:1080:420:0,scale={pip_w}:{pip_h}[pip]")
         parts.append(f"[screen][pip]overlay=W-w-{pip_mr}:H-h-{pip_mb}[vout]")
 
-    # Аудио fade
-    parts.append(
-        f"[audio_concat]afade=t=in:st=0:d=0.5,"
-        f"afade=t=out:st={fade_out:.3f}:d=0.5[aout]"
-    )
+    # Без fade: сохраняем исходную аудиодорожку после склейки
+    parts.append("[audio_concat]anull[aout]")
 
     return ";".join(parts)
 
