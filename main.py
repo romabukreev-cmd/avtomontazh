@@ -65,8 +65,14 @@ def _build_timeline(segments: List[Dict]) -> List[Dict]:
     if not intervals:
         return []
 
-    # Маленький буфер: 50мс до, 100мс после каждого блока
-    padded = [[max(0.0, s - 0.05), e + 0.1] for s, e in intervals]
+    # Маленький буфер вокруг каждого блока слов
+    padded = [
+        [
+            max(0.0, s - config.TIMELINE_START_PAD_SEC),
+            e + config.TIMELINE_END_PAD_SEC,
+        ]
+        for s, e in intervals
+    ]
 
     # Сортировка + merge пересекающихся интервалов
     padded.sort(key=lambda x: x[0])

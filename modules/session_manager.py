@@ -80,9 +80,20 @@ class SessionManager:
         return sessions
 
     def is_processed(self, session_name: str) -> bool:
-        """Сессия обработана — в output/name/ есть хотя бы один .mp4."""
+        """
+        Сессия считается обработанной только когда готовы оба итоговых файла.
+        Это не скрывает сессию после частично упавшего рендера.
+        """
         out = config.OUTPUT_DIR / session_name
-        return out.exists() and any(out.glob("*.mp4"))
+        if not out.exists():
+            return False
+
+        vertical = out / "vertical_9min.mp4"
+        horizontal = out / "horizontal_9min.mp4"
+        return (
+            vertical.exists() and vertical.is_file() and vertical.stat().st_size > 0
+            and horizontal.exists() and horizontal.is_file() and horizontal.stat().st_size > 0
+        )
 
     def concat_files(self, session: Session) -> Tuple[Path, Path]:
         """
@@ -100,9 +111,14 @@ class SessionManager:
     # ── Вспомогательные ───────────────────────────────────────────────────────
 
     def _find_sorted_files(self, directory: Path, pattern: str) -> List[Path]:
+        prefix = pattern.replace("*", "").lower()
         files = [
-            f for f in directory.glob(pattern)
-            if f.suffix.lower() in config.VIDEO_EXTENSIONS
+            f for f in directory.iterdir()
+            if (
+                f.is_file()
+                and f.suffix.lower() in config.VIDEO_EXTENSIONS
+                and f.stem.lower().startswith(prefix)
+            )
         ]
         files.sort(key=lambda f: self._extract_number(f.stem))
         return files

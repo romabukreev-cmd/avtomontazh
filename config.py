@@ -19,8 +19,10 @@ LOGS_DIR   = BASE_DIR / "logs"
 
 # ── Файлы сессии ───────────────────────────────────────────────────────────────
 
-SCREEN_FILE_PATTERN = "screen_*"
-WEBCAM_FILE_PATTERN = "webcam_*"
+# Поддерживаем оба варианта именования:
+# screen_001.mp4 / webcam_001.mp4 и screen.mp4 / webcam.mp4
+SCREEN_FILE_PATTERN = "screen*"
+WEBCAM_FILE_PATTERN = "webcam*"
 VIDEO_EXTENSIONS    = {".mp4", ".mkv", ".avi", ".mov", ".ts"}
 
 # ── Whisper ────────────────────────────────────────────────────────────────────
@@ -33,6 +35,8 @@ VAD_SPEECH_PAD_MS  = 200   # мс — буфер вокруг речевого �
 # ── Пороги ────────────────────────────────────────────────────────────────────
 
 PAUSE_CUT_SEC = 0.5    # пауза >= этого → разрыв между блоками слов
+TIMELINE_START_PAD_SEC = 0.05
+TIMELINE_END_PAD_SEC   = 0.20
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
