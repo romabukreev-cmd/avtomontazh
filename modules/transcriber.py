@@ -71,17 +71,17 @@ class Transcriber:
             headers["X-Proxy-Secret"] = config.GROQ_PROXY_SECRET
 
         with open(audio_path, "rb") as f:
-            files = {"file": (audio_path.name, f, "audio/flac")}
-            data = [
-                ("model", config.WHISPER_MODEL),
-                ("language", config.WHISPER_LANGUAGE),
-                ("response_format", "verbose_json"),
-                ("timestamp_granularities[]", "word"),
-                ("timestamp_granularities[]", "segment"),
-                ("temperature", "0"),
-            ]
-            with httpx.Client(timeout=600.0) as client:
-                r = client.post(url, headers=headers, files=files, data=data)
+            content = f.read()
+        files = {"file": (audio_path.name, content, "audio/flac")}
+        data = {
+            "model": config.WHISPER_MODEL,
+            "language": config.WHISPER_LANGUAGE,
+            "response_format": "verbose_json",
+            "timestamp_granularities[]": ["word", "segment"],
+            "temperature": "0",
+        }
+        with httpx.Client(timeout=600.0) as client:
+            r = client.post(url, headers=headers, files=files, data=data)
         if r.status_code != 200:
             raise RuntimeError(f"Groq API {r.status_code}: {r.text[:500]}")
         return r.json()
