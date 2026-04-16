@@ -81,19 +81,15 @@ class SessionManager:
 
     def is_processed(self, session_name: str) -> bool:
         """
-        Сессия считается обработанной только когда готовы оба итоговых файла.
-        Это не скрывает сессию после частично упавшего рендера.
+        Сессия считается обработанной когда готов итоговый vertical-файл.
+        Горизонтальный рендер временно отключён.
         """
         out = config.OUTPUT_DIR / session_name
         if not out.exists():
             return False
 
         vertical = out / "vertical_9min.mp4"
-        horizontal = out / "horizontal_9min.mp4"
-        return (
-            vertical.exists() and vertical.is_file() and vertical.stat().st_size > 0
-            and horizontal.exists() and horizontal.is_file() and horizontal.stat().st_size > 0
-        )
+        return vertical.exists() and vertical.is_file() and vertical.stat().st_size > 0
 
     def concat_files(self, session: Session) -> Tuple[Path, Path]:
         """

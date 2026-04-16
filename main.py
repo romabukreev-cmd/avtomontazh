@@ -139,12 +139,13 @@ def _pipeline(session: Session, progress: Callable[[str], None]) -> None:
     )
     done("✅ Рендер 9:16 готов")
 
-    working("⏳ Рендер 16:9...")
-    renderer.render_horizontal(
-        timeline, output_dir, screen_file, webcam_file,
-        on_progress=lambda pct: working(f"⏳ Рендер 16:9: {bar(pct)} {pct}%"),
-    )
-    done("✅ Рендер 16:9 готов")
+    # Горизонтальный рендер временно отключён — нужна только вертикалка.
+    # working("⏳ Рендер 16:9...")
+    # renderer.render_horizontal(
+    #     timeline, output_dir, screen_file, webcam_file,
+    #     on_progress=lambda pct: working(f"⏳ Рендер 16:9: {bar(pct)} {pct}%"),
+    # )
+    # done("✅ Рендер 16:9 готов")
 
     # Очистка temp
     if config.CLEANUP_TEMP_ON_SUCCESS:
