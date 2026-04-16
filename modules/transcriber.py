@@ -1,19 +1,20 @@
 """
-transcriber.py — транскрипция видео через faster-whisper.
+transcriber.py — транскрипция видео через Groq Whisper API.
 
-Модель загружается при каждом вызове transcribe() и выгружается сразу после —
-чтобы не держать ~3GB в памяти во время LLM и FFmpeg.
+Groq блокирует российские IP, поэтому запросы идут через Cloudflare
+Worker-прокси (адрес и секрет в .env). При пустом GROQ_PROXY_URL идёт
+прямо в api.groq.com (полезно для отладки с не-РФ IP).
 
-Ключевая функция _compute_boundaries() вычисляет точные start/end из word timestamps
-и выполняет корректный клиппинг: если точка обрезки попадает внутрь последнего слова,
-откатываем clip до начала этого слова, чтобы не создавать заикание.
+Аудио извлекается в FLAC mono 16kHz — сжатие 6-8× против WAV, помещается
+в лимит 25 MB Free tier'а даже для часовых видео.
 """
 
-import gc
 import logging
 import subprocess
 from pathlib import Path
 from typing import Dict, List
+
+import httpx
 
 import config
 
@@ -23,91 +24,73 @@ log = logging.getLogger(__name__)
 class Transcriber:
 
     def transcribe(self, video_path: Path) -> List[Dict]:
-        """
-        Транскрибирует видео и возвращает список сегментов с точными границами.
-
-        Каждый сегмент:
-            {index, start, end, text, words: [{word, start, end}, ...]}
-        """
         config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        wav_path = config.TEMP_DIR / f"{video_path.stem}_audio.wav"
+        audio_path = config.TEMP_DIR / f"{video_path.stem}_audio.flac"
 
         log.info(f"Извлекаю аудио из {video_path.name}...")
-        self._extract_audio(video_path, wav_path)
+        self._extract_audio(video_path, audio_path)
 
-        log.info(f"Загружаю Whisper {config.WHISPER_MODEL}...")
-        from faster_whisper import WhisperModel
-        model = WhisperModel(
-            config.WHISPER_MODEL,
-            device="auto",
-            compute_type="auto",
-        )
-
-        try:
-            log.info("Транскрипция...")
-            segments_iter, info = model.transcribe(
-                str(wav_path),
-                language=config.WHISPER_LANGUAGE,
-                word_timestamps=True,
-                vad_filter=True,
-                vad_parameters={
-                    "min_silence_duration_ms": config.VAD_MIN_SILENCE_MS,
-                    "speech_pad_ms":           config.VAD_SPEECH_PAD_MS,
-                },
-                condition_on_previous_text=False,
-                hallucination_silence_threshold=2.0,
+        size_mb = audio_path.stat().st_size / 1024 / 1024
+        log.info(f"Аудио готово: {audio_path.name} ({size_mb:.1f} MB)")
+        if size_mb > config.GROQ_MAX_FILE_MB:
+            audio_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Аудио {size_mb:.1f} MB > лимит Groq {config.GROQ_MAX_FILE_MB} MB. "
+                f"Разбей видео на части или понизь битрейт."
             )
 
-            raw = []
-            for idx, seg in enumerate(segments_iter):
-                words = [
-                    {"word": w.word, "start": w.start, "end": w.end}
-                    for w in (seg.words or [])
-                ]
-                words = _dedup_consecutive(words)
-                raw.append({
-                    "index":      idx,
-                    "_seg_start": seg.start,
-                    "_seg_end":   seg.end,
-                    "text":       seg.text.strip(),
-                    "words":      words,
-                })
-
-            log.info(f"Получено {len(raw)} сегментов, длительность аудио {info.duration:.0f}с")
-            return _compute_boundaries(raw)
-
+        log.info(f"Транскрипция через Groq ({config.WHISPER_MODEL})...")
+        try:
+            data = self._call_groq(audio_path)
         finally:
-            wav_path.unlink(missing_ok=True)
-            del model
-            gc.collect()
-            try:
-                import ctypes
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
+            audio_path.unlink(missing_ok=True)
 
-    def _extract_audio(self, video_path: Path, wav_path: Path) -> None:
+        segments = _build_segments(data.get("segments", []), data.get("words", []))
+        log.info(f"Получено {len(segments)} сегментов")
+        return segments
+
+    def _extract_audio(self, video_path: Path, audio_path: Path) -> None:
         cmd = [
             "ffmpeg", "-y",
             "-i", str(video_path),
             "-vn",
-            "-acodec", "pcm_s16le",
-            "-ar", "16000",
             "-ac", "1",
-            str(wav_path),
+            "-ar", "16000",
+            "-c:a", "flac",
+            "-compression_level", "8",
+            str(audio_path),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Ошибка извлечения аудио:\n{result.stderr[-1000:]}")
 
+    def _call_groq(self, audio_path: Path) -> dict:
+        url = f"{config.GROQ_PROXY_URL.rstrip('/')}/openai/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {config.GROQ_API_KEY}"}
+        if config.GROQ_PROXY_SECRET:
+            headers["X-Proxy-Secret"] = config.GROQ_PROXY_SECRET
+
+        with open(audio_path, "rb") as f:
+            files = {"file": (audio_path.name, f, "audio/flac")}
+            data = [
+                ("model", config.WHISPER_MODEL),
+                ("language", config.WHISPER_LANGUAGE),
+                ("response_format", "verbose_json"),
+                ("timestamp_granularities[]", "word"),
+                ("timestamp_granularities[]", "segment"),
+                ("temperature", "0"),
+            ]
+            with httpx.Client(timeout=600.0) as client:
+                r = client.post(url, headers=headers, files=files, data=data)
+        if r.status_code != 200:
+            raise RuntimeError(f"Groq API {r.status_code}: {r.text[:500]}")
+        return r.json()
+
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def _dedup_consecutive(words: List[Dict]) -> List[Dict]:
-    """
-    Убирает подряд идущие одинаковые слова с паузой < 0.5с между ними.
-    Whisper иногда дублирует слово внутри одного сегмента.
-    """
+    """Убирает подряд идущие одинаковые слова с паузой < 0.5с между ними."""
     if not words:
         return words
     result = [words[0]]
@@ -121,25 +104,43 @@ def _dedup_consecutive(words: List[Dict]) -> List[Dict]:
     return result
 
 
-def _compute_boundaries(raw: List[Dict]) -> List[Dict]:
+def _build_segments(segments_raw: List[Dict], words_raw: List[Dict]) -> List[Dict]:
     """
-    Форматирует сегменты из Whisper.
-    Использует нативные timestamps без изменений — Whisper достаточно точен.
+    Groq/OpenAI Whisper API отдаёт сегменты и слова плоскими списками.
+    Распределяем слова по сегментам по попаданию во временной диапазон,
+    затем приравниваем границы сегмента к границам его первого/последнего слова.
     """
     result = []
-    for seg in raw:
-        words = seg["words"]
-        if words:
-            seg_start = words[0]["start"]
-            seg_end   = words[-1]["end"]
+    wi = 0
+    n_words = len(words_raw)
+
+    for idx, seg in enumerate(segments_raw):
+        seg_end = seg["end"]
+        seg_words: List[Dict] = []
+        while wi < n_words and words_raw[wi]["start"] < seg_end:
+            w = words_raw[wi]
+            if w["start"] >= seg["start"]:
+                seg_words.append({
+                    "word":  w["word"],
+                    "start": w["start"],
+                    "end":   w["end"],
+                })
+            wi += 1
+
+        seg_words = _dedup_consecutive(seg_words)
+
+        if seg_words:
+            s_start = seg_words[0]["start"]
+            s_end   = seg_words[-1]["end"]
         else:
-            seg_start = seg["_seg_start"]
-            seg_end   = seg["_seg_end"]
+            s_start = seg["start"]
+            s_end   = seg["end"]
+
         result.append({
-            "index": seg["index"],
-            "start": round(seg_start, 3),
-            "end":   round(seg_end,   3),
-            "text":  seg["text"],
-            "words": words,
+            "index": idx,
+            "start": round(s_start, 3),
+            "end":   round(s_end,   3),
+            "text":  (seg.get("text") or "").strip(),
+            "words": seg_words,
         })
     return result

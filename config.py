@@ -25,12 +25,17 @@ SCREEN_FILE_PATTERN = "screen*"
 WEBCAM_FILE_PATTERN = "webcam*"
 VIDEO_EXTENSIONS    = {".mp4", ".mkv", ".avi", ".mov", ".ts"}
 
-# ── Whisper ────────────────────────────────────────────────────────────────────
+# ── Whisper (Groq API через Cloudflare Worker-прокси) ─────────────────────────
 
-WHISPER_MODEL    = "large-v3"
+WHISPER_MODEL    = "whisper-large-v3-turbo"
 WHISPER_LANGUAGE = "ru"
-VAD_MIN_SILENCE_MS = 400   # мс — минимальная тишина между сегментами
-VAD_SPEECH_PAD_MS  = 200   # мс — буфер вокруг речевого региона
+
+GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
+GROQ_PROXY_URL    = os.getenv("GROQ_PROXY_URL", "https://api.groq.com")
+GROQ_PROXY_SECRET = os.getenv("GROQ_PROXY_SECRET", "")
+
+# Лимит файла на Groq Free tier = 25 MB. Audio: FLAC mono 16kHz ≈ 250 KB/мин.
+GROQ_MAX_FILE_MB = 24
 
 # ── Пороги ────────────────────────────────────────────────────────────────────
 
