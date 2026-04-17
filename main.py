@@ -30,7 +30,7 @@ log = logging.getLogger("main")
 
 # Параметры silencedetect
 _SILENCE_NOISE_DB = -30       # порог тишины (dBFS)
-_SILENCE_MIN_DUR  = 2.0       # минимальная длительность тишины (сек)
+_SILENCE_MIN_DUR  = 1.0       # минимальная длительность тишины (сек)
 _MIN_SPEECH_CHUNK = 0.3       # минимальный остаток после вычитания (сек)
 
 
