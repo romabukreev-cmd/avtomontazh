@@ -8,8 +8,15 @@ concat не получит данные со всех входов → OOM. За
 (≤100 MB памяти на процесс), затем все chunk_*.mp4 склеиваются через
 `concat demuxer -c copy` без перекодирования. Память O(1) по длине видео.
 
-Для безболезненной склейки через `-c copy` все чанки должны быть одинаковыми
-по кодеку/fps/разрешению/audio rate — параметры жёстко фиксируются.
+Seek внутри чанка делается так: `-ss` перед `-i` быстро позиционирует
+декодер на ~2с до нужной точки (до ближайшего keyframe), затем trim/atrim
+в filter_complex отрезает по точному кадру — тот же accurate cut, что был
+в старом монолитном filter_complex, просто применённый к одному отрезку.
+Это устраняет «обрезание начала» и desync, которые ловил `-ss` перед `-i`
+со снапом прямо на keyframe без финального trim.
+
+Для безболезненной склейки через `-c copy` все чанки одинаковы по
+кодеку/fps/разрешению/audio rate — параметры жёстко фиксируются.
 """
 
 import logging
@@ -25,7 +32,8 @@ log = logging.getLogger(__name__)
 _TARGET_FPS         = 30
 _TARGET_AUDIO_RATE  = 48000
 _TARGET_PIX_FMT     = "yuv420p"
-_KEYFRAME_INTERVAL  = 60   # GOP=60 кадров ≈ 2с при 30fps
+_KEYFRAME_INTERVAL  = 60    # GOP=60 кадров ≈ 2с при 30fps
+_PRE_SEEK_BUFFER    = 2.0   # запас до точки трима, чтобы -ss попал в окно с keyframe
 
 
 class VideoRenderer:
@@ -42,7 +50,7 @@ class VideoRenderer:
         return self._render(
             timeline, output_dir, screen_file, webcam_file,
             output_name="vertical_9min.mp4",
-            filter_complex=_vertical_filter(config.SCREEN_CROP_Y),
+            filter_builder=lambda s, e: _vertical_filter(config.SCREEN_CROP_Y, s, e),
             on_progress=on_progress,
         )
 
@@ -58,10 +66,11 @@ class VideoRenderer:
         return self._render(
             timeline, output_dir, screen_file, webcam_file,
             output_name="horizontal_9min.mp4",
-            filter_complex=_horizontal_filter(
+            filter_builder=lambda s, e: _horizontal_filter(
                 config.SCREEN_CROP_Y,
                 config.PIP_WIDTH, config.PIP_HEIGHT,
                 config.PIP_MARGIN_RIGHT, config.PIP_MARGIN_BOTTOM,
+                s, e,
             ),
             on_progress=on_progress,
         )
@@ -75,7 +84,7 @@ class VideoRenderer:
         screen_file:    Path,
         webcam_file:    Path,
         output_name:    str,
-        filter_complex: str,
+        filter_builder: Callable[[float, float], str],
         on_progress:    Optional[Callable[[int], None]],
     ) -> Path:
         if not timeline:
@@ -93,7 +102,7 @@ class VideoRenderer:
         try:
             for i, seg in enumerate(timeline):
                 chunk_path = chunks_dir / f"chunk_{i:04d}.mp4"
-                self._render_chunk(seg, screen_file, webcam_file, chunk_path, filter_complex)
+                self._render_chunk(seg, screen_file, webcam_file, chunk_path, filter_builder)
                 chunk_paths.append(chunk_path)
 
                 if on_progress:
@@ -134,17 +143,23 @@ class VideoRenderer:
         screen_file:    Path,
         webcam_file:    Path,
         chunk_path:     Path,
-        filter_complex: str,
+        filter_builder: Callable[[float, float], str],
     ) -> None:
         start = seg["start"]
-        dur   = seg["end"] - start
+        end   = seg["end"]
+
+        # Быстрый input-seek близко к цели (до ближайшего keyframe в запасе
+        # _PRE_SEEK_BUFFER секунд), потом точный кадровый cut через trim/atrim.
+        pre_seek    = max(0.0, start - _PRE_SEEK_BUFFER)
+        local_start = start - pre_seek
+        local_end   = end   - pre_seek
+
+        filter_complex = filter_builder(local_start, local_end)
 
         cmd = [
             "ffmpeg", "-y",
-            "-ss", f"{start:.3f}", "-t", f"{dur:.3f}",
-            "-i", str(screen_file),
-            "-ss", f"{start:.3f}", "-t", f"{dur:.3f}",
-            "-i", str(webcam_file),
+            "-ss", f"{pre_seek:.3f}", "-i", str(screen_file),
+            "-ss", f"{pre_seek:.3f}", "-i", str(webcam_file),
             "-filter_complex", filter_complex,
             "-map", "[vout]", "-map", "[aout]",
             "-c:v", config.VIDEO_CODEC,
@@ -164,26 +179,33 @@ class VideoRenderer:
         if result.returncode != 0:
             raise RuntimeError(
                 f"Рендер чанка {chunk_path.name} упал "
-                f"(seg {start:.2f}→{seg['end']:.2f}, код {result.returncode}):\n"
+                f"(seg {start:.2f}→{end:.2f}, код {result.returncode}):\n"
                 f"{result.stderr[-2000:]}"
             )
 
 
-# ── Фильтры компоновки (один отрезок, два входа) ──────────────────────────────
+# ── Фильтры компоновки (trim + composition на один отрезок) ───────────────────
 
-def _vertical_filter(crop_y: int) -> str:
+def _vertical_filter(crop_y: int, s: float, e: float) -> str:
     return (
-        f"[0:v]crop=1215:1080:352:{crop_y},scale=1080:960[top];"
-        f"[1:v]scale=1920:1080:flags=lanczos,setsar=1,crop=1215:1080:352:0,scale=1080:960[bot];"
+        f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
+        f"crop=1215:1080:352:{crop_y},scale=1080:960[top];"
+        f"[1:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
+        f"scale=1920:1080:flags=lanczos,setsar=1,crop=1215:1080:352:0,scale=1080:960[bot];"
         f"[top][bot]vstack[vout];"
-        f"[0:a]anull[aout]"
+        f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[aout]"
     )
 
 
-def _horizontal_filter(crop_y: int, pip_w: int, pip_h: int, pip_mr: int, pip_mb: int) -> str:
+def _horizontal_filter(
+    crop_y: int, pip_w: int, pip_h: int, pip_mr: int, pip_mb: int,
+    s: float, e: float,
+) -> str:
     return (
-        f"[0:v]crop=1920:1080:0:{crop_y}[screen];"
-        f"[1:v]crop=1080:1080:420:0,scale={pip_w}:{pip_h}[pip];"
+        f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
+        f"crop=1920:1080:0:{crop_y}[screen];"
+        f"[1:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
+        f"crop=1080:1080:420:0,scale={pip_w}:{pip_h}[pip];"
         f"[screen][pip]overlay=W-w-{pip_mr}:H-h-{pip_mb}[vout];"
-        f"[0:a]anull[aout]"
+        f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[aout]"
     )

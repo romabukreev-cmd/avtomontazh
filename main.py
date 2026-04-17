@@ -99,16 +99,16 @@ def _pipeline(session: Session, progress: Callable[[str], None]) -> None:
     def working(line: str) -> None:
         progress(f"▶ <b>{name}</b>\n\n" + "\n".join(completed + [line]))
 
-    # 1. Транскрипция по исходным частям (с offset-ами) — без лишнего склея/резки
-    working("⏳ Транскрипция (Whisper)...")
-    segments   = transcriber.transcribe(session.screen_files)
-    speech_dur = sum(s["end"] - s["start"] for s in segments)
-    done(f"✅ Транскрипция: {len(segments)} сегментов ({format_duration(speech_dur)})")
-
-    # 2. Конкатенация (для рендера — один screen.mp4 + один webcam.mp4)
+    # 1. Конкатенация
     working("⏳ Склеиваю файлы...")
     screen_file, webcam_file = session_manager.concat_files(session)
     done("✅ Файлы готовы")
+
+    # 2. Транскрипция
+    working("⏳ Транскрипция (Whisper)...")
+    segments   = transcriber.transcribe(screen_file)
+    speech_dur = sum(s["end"] - s["start"] for s in segments)
+    done(f"✅ Транскрипция: {len(segments)} сегментов ({format_duration(speech_dur)})")
 
     # 3. LLM анализ
     def on_llm_progress(msg: str) -> None:
