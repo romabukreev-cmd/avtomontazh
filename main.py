@@ -83,7 +83,19 @@ def _build_timeline(segments: List[Dict]) -> List[Dict]:
         else:
             merged.append([s, e])
 
-    return [{"start": round(s, 3), "end": round(e, 3)} for s, e in merged]
+    result = [{"start": round(s, 3), "end": round(e, 3)} for s, e in merged]
+
+    # Диагностика длинных интервалов
+    long_ivs = [(r["start"], r["end"], round(r["end"] - r["start"], 2))
+                for r in result if r["end"] - r["start"] > 3.0]
+    if long_ivs:
+        log.info(f"Длинные интервалы >3с ({len(long_ivs)} шт): "
+                 f"{[(s, e, d) for s, e, d in long_ivs[:10]]}")
+    log.info(f"Timeline: {len(result)} интервалов, "
+             f"total={round(sum(r['end']-r['start'] for r in result), 1)}с, "
+             f"max={round(max(r['end']-r['start'] for r in result), 2)}с")
+
+    return result
 
 
 # ── Пайплайн ──────────────────────────────────────────────────────────────────
