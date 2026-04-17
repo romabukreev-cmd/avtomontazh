@@ -9,6 +9,7 @@ Worker-прокси (адрес и секрет в .env). При пустом GR
 в лимит 25 MB Free tier'а даже для часовых видео.
 """
 
+import bisect
 import logging
 import subprocess
 from pathlib import Path
@@ -202,27 +203,26 @@ def _dedup_consecutive(words: List[Dict]) -> List[Dict]:
 def _build_segments(segments_raw: List[Dict], words_raw: List[Dict]) -> List[Dict]:
     """
     Groq/OpenAI Whisper API отдаёт сегменты и слова плоскими списками.
-    Распределяем слова по сегментам по попаданию во временной диапазон,
-    затем приравниваем границы сегмента к границам его первого/последнего слова.
+    Распределяем слова по сегментам через bisect-поиск по диапазону
+    [seg.start, seg.end), а не pointer-ом — pointer ломается когда
+    Whisper-сегмент из чанка N имеет end > начала следующего чанка и
+    «съедает» слова, оставляя последующие сегменты без слов.
     """
+    words_sorted = sorted(words_raw, key=lambda w: w.get("start", 0.0))
+    word_starts  = [w.get("start", 0.0) for w in words_sorted]
+
+    empty_segs = 0
     result = []
-    wi = 0
-    n_words = len(words_raw)
-
     for idx, seg in enumerate(segments_raw):
-        seg_end = seg["end"]
-        seg_words: List[Dict] = []
-        while wi < n_words and words_raw[wi]["start"] < seg_end:
-            w = words_raw[wi]
-            if w["start"] >= seg["start"]:
-                seg_words.append({
-                    "word":  w["word"],
-                    "start": w["start"],
-                    "end":   w["end"],
-                })
-            wi += 1
-
+        lo = bisect.bisect_left(word_starts,  seg["start"])
+        hi = bisect.bisect_left(word_starts,  seg["end"])
+        seg_words = [
+            {"word": w["word"], "start": w["start"], "end": w["end"]}
+            for w in words_sorted[lo:hi]
+        ]
         seg_words = _dedup_consecutive(seg_words)
+        if not seg_words:
+            empty_segs += 1
 
         if seg_words:
             s_start = seg_words[0]["start"]
@@ -238,4 +238,8 @@ def _build_segments(segments_raw: List[Dict], words_raw: List[Dict]) -> List[Dic
             "text":  (seg.get("text") or "").strip(),
             "words": seg_words,
         })
+
+    if empty_segs:
+        log.warning(f"_build_segments: {empty_segs}/{len(segments_raw)} сегментов без слов → используем границы Whisper")
+    log.info(f"_build_segments: {len(segments_raw)} сег, {len(words_raw)} слов")
     return result
