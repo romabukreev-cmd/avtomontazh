@@ -5,16 +5,18 @@ main.py — точка входа системы Автомонтаж.
   1. concat_files()    — склеить части сессии
   2. transcribe()      — Whisper → sentence-level сегменты с word timestamps
   3. analyze()         — LLM чанками → kept_segments (удалены смысловые повторы)
-  4. _build_timeline()  — удалить паузы внутри kept-сегментов → timeline
-  5. render_vertical()  — FFmpeg → vertical_9min.mp4
-  6. render_horizontal() — FFmpeg → horizontal_9min.mp4
+  4. _detect_silence() — silencedetect на оригинале → карта тишины
+  5. _build_timeline() — удалить паузы + вычесть тихие зоны → timeline
+  6. render_vertical() — FFmpeg → vertical_9min.mp4
 """
 
 import logging
+import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 import config
 from modules.bot import AutomontazhBot
@@ -26,6 +28,11 @@ from modules.utils import ensure_dirs, format_duration, setup_logging
 
 log = logging.getLogger("main")
 
+# Параметры silencedetect
+_SILENCE_NOISE_DB = -30       # порог тишины (dBFS)
+_SILENCE_MIN_DUR  = 2.0       # минимальная длительность тишины (сек)
+_MIN_SPEECH_CHUNK = 0.3       # минимальный остаток после вычитания (сек)
+
 
 # ── Глобальные объекты (создаются один раз при запуске) ───────────────────────
 
@@ -35,14 +42,83 @@ analyzer        = LLMAnalyzer()
 renderer        = VideoRenderer()
 
 
+# ── Определение тишины ────────────────────────────────────────────────────────
+
+def _detect_silence(video_path: Path) -> List[List[float]]:
+    """
+    Запускает ffmpeg silencedetect на аудиодорожке видео.
+    Возвращает список [start, end] тихих зон.
+    """
+    cmd = [
+        "ffmpeg", "-i", str(video_path), "-af",
+        f"silencedetect=noise={_SILENCE_NOISE_DB}dB:d={_SILENCE_MIN_DUR}",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    regions: List[List[float]] = []
+    for line in result.stderr.split("\n"):
+        m_start = re.search(r"silence_start: ([\d.]+)", line)
+        m_end = re.search(r"silence_end: ([\d.]+)", line)
+        if m_start:
+            regions.append([float(m_start.group(1)), 0.0])
+        elif m_end and regions and regions[-1][1] == 0.0:
+            regions[-1][1] = float(m_end.group(1))
+
+    # Убрать незакрытые (тишина до конца файла)
+    regions = [r for r in regions if r[1] > 0.0]
+    log.info(f"Silencedetect: {len(regions)} тихих зон "
+             f"(noise={_SILENCE_NOISE_DB}dB, min_dur={_SILENCE_MIN_DUR}с)")
+    return regions
+
+
+def _subtract_silence(
+    start: float,
+    end: float,
+    silence_regions: List[List[float]],
+) -> List[List[float]]:
+    """
+    Вычитает тихие зоны из интервала [start, end].
+    Возвращает список речевых кусков >= _MIN_SPEECH_CHUNK.
+    """
+    parts = [[start, end]]
+    for s_start, s_end in silence_regions:
+        if not parts:
+            break
+        # Быстрый skip: тишина полностью до или после всех частей
+        if s_end <= parts[0][0]:
+            continue
+        if s_start >= parts[-1][1]:
+            break
+        new_parts: List[List[float]] = []
+        for p_start, p_end in parts:
+            if s_end <= p_start or s_start >= p_end:
+                # Нет пересечения
+                new_parts.append([p_start, p_end])
+            else:
+                # Часть до тишины
+                if s_start > p_start:
+                    new_parts.append([p_start, s_start])
+                # Часть после тишины
+                if s_end < p_end:
+                    new_parts.append([s_end, p_end])
+        parts = new_parts
+
+    return [p for p in parts if p[1] - p[0] >= _MIN_SPEECH_CHUNK]
+
+
 # ── Разбивка по паузам ────────────────────────────────────────────────────────
 
-def _build_timeline(segments: List[Dict]) -> List[Dict]:
+def _build_timeline(
+    segments: List[Dict],
+    silence_regions: Optional[List[List[float]]] = None,
+) -> List[Dict]:
     """
     Строит timeline из kept-сегментов:
     1. Режет паузы >= PAUSE_CUT_SEC между словами
     2. Добавляет маленький буфер вокруг каждого блока слов
-    3. Сортирует по времени и мёрджит пересечения — гарантирует корректный порядок
+    3. Сортирует по времени и мёрджит пересечения
+    4. Вычитает тихие зоны (silencedetect) — убирает галлюцинации Whisper
     """
     intervals: List[List[float]] = []
 
@@ -83,17 +159,31 @@ def _build_timeline(segments: List[Dict]) -> List[Dict]:
         else:
             merged.append([s, e])
 
+    # Вычесть тихие зоны из интервалов
+    if silence_regions:
+        before_count = len(merged)
+        before_dur = sum(e - s for s, e in merged)
+        filtered: List[List[float]] = []
+        for s, e in merged:
+            speech_parts = _subtract_silence(s, e, silence_regions)
+            filtered.extend(speech_parts)
+        if filtered:
+            merged = filtered
+            after_dur = sum(e - s for s, e in merged)
+            log.info(f"Silence filter: {before_count}→{len(merged)} интервалов, "
+                     f"{before_dur:.0f}с→{after_dur:.0f}с "
+                     f"(вырезано {before_dur - after_dur:.0f}с тишины)")
+        else:
+            log.warning("Silence filter убрал ВСЕ интервалы — оставляем без фильтра")
+
     result = [{"start": round(s, 3), "end": round(e, 3)} for s, e in merged]
 
-    # Диагностика длинных интервалов
-    long_ivs = [(r["start"], r["end"], round(r["end"] - r["start"], 2))
-                for r in result if r["end"] - r["start"] > 3.0]
-    if long_ivs:
-        log.info(f"Длинные интервалы >3с ({len(long_ivs)} шт): "
-                 f"{[(s, e, d) for s, e, d in long_ivs[:10]]}")
-    log.info(f"Timeline: {len(result)} интервалов, "
-             f"total={round(sum(r['end']-r['start'] for r in result), 1)}с, "
-             f"max={round(max(r['end']-r['start'] for r in result), 2)}с")
+    # Диагностика
+    if result:
+        total_dur = sum(r["end"] - r["start"] for r in result)
+        max_dur = max(r["end"] - r["start"] for r in result)
+        log.info(f"Timeline: {len(result)} интервалов, "
+                 f"total={round(total_dur, 1)}с, max={round(max_dur, 2)}с")
 
     return result
 
@@ -131,8 +221,10 @@ def _pipeline(session: Session, progress: Callable[[str], None]) -> None:
     kept_dur  = sum(s["end"] - s["start"] for s in kept)
     done(f"✅ AI: {len(kept)}/{len(segments)} сегментов ({format_duration(kept_dur)})")
 
-    # 4. Удаление пауз
-    timeline = _build_timeline(kept)
+    # 4. Определение тишины + удаление пауз
+    working("⏳ Анализ тихих зон...")
+    silence_regions = _detect_silence(screen_file)
+    timeline = _build_timeline(kept, silence_regions=silence_regions)
     tl_dur   = sum(s["end"] - s["start"] for s in timeline)
     done(f"✅ Паузы вырезаны: {format_duration(tl_dur)}")
 
