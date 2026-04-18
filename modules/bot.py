@@ -443,12 +443,23 @@ class AutomontazhBot:
                 f"\n\n⏳ Следующая: <b>{self._queue[0].name}</b>"
                 if self._queue else ""
             )
-            await upload_msg.edit_text(
+            success_text = (
                 f"✅ <b>Готово!</b> Видео на Google Drive:\n"
                 f"<code>PROJECTS/Автомонтаж/output/{session_name}/</code>"
-                f"{q_info}",
-                parse_mode="HTML",
+                f"{q_info}"
             )
+            try:
+                await upload_msg.edit_text(success_text, parse_mode="HTML")
+            except Exception as tg_err:
+                log.warning(f"edit_text не удался для {session_name}: {tg_err}")
+                try:
+                    await self._app.bot.send_message(
+                        chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
+                        text=success_text,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
         except Exception as e:
             log.error(f"Ошибка обработки {session_name}: {e}", exc_info=True)
