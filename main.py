@@ -141,25 +141,16 @@ def _build_timeline(
     if not intervals:
         return []
 
-    # Маленький буфер вокруг каждого блока слов
-    padded = [
-        [
-            max(0.0, s - config.TIMELINE_START_PAD_SEC),
-            e + config.TIMELINE_END_PAD_SEC,
-        ]
-        for s, e in intervals
-    ]
-
-    # Сортировка + merge пересекающихся интервалов
-    padded.sort(key=lambda x: x[0])
-    merged = [padded[0][:]]
-    for s, e in padded[1:]:
+    # Сортировка + merge пересекающихся интервалов (без паддинга)
+    intervals.sort(key=lambda x: x[0])
+    merged = [intervals[0][:]]
+    for s, e in intervals[1:]:
         if s <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], e)
         else:
             merged.append([s, e])
 
-    # Вычесть тихие зоны из интервалов
+    # Вычесть тихие зоны ДО паддинга — иначе паддинг срезается тишиной
     if silence_regions:
         before_count = len(merged)
         before_dur = sum(e - s for s, e in merged)
@@ -176,7 +167,25 @@ def _build_timeline(
         else:
             log.warning("Silence filter убрал ВСЕ интервалы — оставляем без фильтра")
 
-    result = [{"start": round(s, 3), "end": round(e, 3)} for s, e in merged]
+    # Паддинг ПОСЛЕ вычитания тишины — буфер гарантированно сохраняется
+    padded = [
+        [
+            max(0.0, s - config.TIMELINE_START_PAD_SEC),
+            e + config.TIMELINE_END_PAD_SEC,
+        ]
+        for s, e in merged
+    ]
+
+    # Re-merge после паддинга (паддинг может создать пересечения)
+    padded.sort(key=lambda x: x[0])
+    final: List[List[float]] = [padded[0][:]]
+    for s, e in padded[1:]:
+        if s <= final[-1][1]:
+            final[-1][1] = max(final[-1][1], e)
+        else:
+            final.append([s, e])
+
+    result = [{"start": round(s, 3), "end": round(e, 3)} for s, e in final]
 
     # Диагностика
     if result:
