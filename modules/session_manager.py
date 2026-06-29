@@ -14,7 +14,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import config
 
@@ -40,7 +40,7 @@ class Session:
 class SessionManager:
 
     def scan_sessions(self) -> List[Session]:
-        """Возвращает сессии готовые к обработке (не обработанные, экран + вебка)."""
+        """Возвращает сессии готовые к обработке (достаточно файлов экрана)."""
         sessions = []
         if not config.INPUT_DIR.exists():
             log.warning(f"Папка input/ не существует: {config.INPUT_DIR}")
@@ -55,15 +55,6 @@ class SessionManager:
 
             if not screen:
                 log.debug(f"Пропуск {session_dir.name}: нет файлов экрана")
-                continue
-            if not webcam:
-                log.debug(f"Пропуск {session_dir.name}: нет файлов вебки")
-                continue
-            if len(screen) != len(webcam):
-                log.warning(
-                    f"Пропуск {session_dir.name}: "
-                    f"несовпадение файлов (экран: {len(screen)}, вебка: {len(webcam)})"
-                )
                 continue
             if self.is_processed(session_dir.name):
                 log.debug(f"Пропуск {session_dir.name}: уже обработана")
@@ -80,28 +71,32 @@ class SessionManager:
         return sessions
 
     def is_processed(self, session_name: str) -> bool:
-        """
-        Сессия считается обработанной когда готов итоговый vertical-файл.
-        Горизонтальный рендер временно отключён.
-        """
+        """Сессия считается обработанной если есть хотя бы один итоговый файл."""
         out = config.OUTPUT_DIR / session_name
         if not out.exists():
             return False
 
-        vertical = out / "vertical_9min.mp4"
-        return vertical.exists() and vertical.is_file() and vertical.stat().st_size > 0
+        for name in ("vertical_9min.mp4", "horizontal_9min.mp4"):
+            f = out / name
+            if f.exists() and f.is_file() and f.stat().st_size > 0:
+                return True
+        return False
 
-    def concat_files(self, session: Session) -> Tuple[Path, Path]:
+    def concat_files(self, session: Session) -> Tuple[Path, Optional[Path]]:
         """
-        Склеивает части сессии в один файл экрана и один файл вебки.
-        Если часть одна — возвращает её напрямую без конкатенации.
+        Склеивает части сессии. Вебка опциональна — если нет, вернёт None.
         """
         if session.file_count == 1:
-            return session.screen_files[0], session.webcam_files[0]
+            webcam = session.webcam_files[0] if session.webcam_files else None
+            return session.screen_files[0], webcam
 
         log.info(f"Конкатенация {session.file_count} частей: {session.name}")
         screen_out = self._concat(session.screen_files, f"{session.name}_screen_full")
-        webcam_out = self._concat(session.webcam_files, f"{session.name}_webcam_full")
+
+        webcam_out = None
+        if session.webcam_files:
+            webcam_out = self._concat(session.webcam_files, f"{session.name}_webcam_full")
+
         return screen_out, webcam_out
 
     # ── Вспомогательные ───────────────────────────────────────────────────────

@@ -199,16 +199,21 @@ def _build_timeline(
 
 # ── Пайплайн ──────────────────────────────────────────────────────────────────
 
-def _pipeline(session: Session, progress: Callable[[str], None]) -> None:
+def _pipeline(
+    session: Session,
+    progress: Callable[[str], None],
+    output_format: str = "vertical",
+) -> None:
     name      = session.name
+    fmt_label = "9:16" if output_format == "vertical" else "16:9"
     completed = []
 
     def done(line: str) -> None:
         completed.append(line)
-        progress(f"▶ <b>{name}</b>\n\n" + "\n".join(completed))
+        progress(f"▶ <b>{name}</b> [{fmt_label}]\n\n" + "\n".join(completed))
 
     def working(line: str) -> None:
-        progress(f"▶ <b>{name}</b>\n\n" + "\n".join(completed + [line]))
+        progress(f"▶ <b>{name}</b> [{fmt_label}]\n\n" + "\n".join(completed + [line]))
 
     # 1. Конкатенация
     working("⏳ Склеиваю файлы...")
@@ -245,20 +250,20 @@ def _pipeline(session: Session, progress: Callable[[str], None]) -> None:
         filled = pct // 10
         return "[" + "▓" * filled + "░" * (10 - filled) + "]"
 
-    working("⏳ Рендер 9:16...")
-    renderer.render_vertical(
-        timeline, output_dir, screen_file, webcam_file,
-        on_progress=lambda pct: working(f"⏳ Рендер 9:16: {bar(pct)} {pct}%"),
-    )
-    done("✅ Рендер 9:16 готов")
-
-    # Горизонтальный рендер временно отключён — нужна только вертикалка.
-    # working("⏳ Рендер 16:9...")
-    # renderer.render_horizontal(
-    #     timeline, output_dir, screen_file, webcam_file,
-    #     on_progress=lambda pct: working(f"⏳ Рендер 16:9: {bar(pct)} {pct}%"),
-    # )
-    # done("✅ Рендер 16:9 готов")
+    if output_format == "vertical":
+        working("⏳ Рендер 9:16...")
+        renderer.render_vertical(
+            timeline, output_dir, screen_file, webcam_file,
+            on_progress=lambda pct: working(f"⏳ Рендер 9:16: {bar(pct)} {pct}%"),
+        )
+        done("✅ Рендер 9:16 готов")
+    else:
+        working("⏳ Рендер 16:9...")
+        renderer.render_horizontal(
+            timeline, output_dir, screen_file, webcam_file,
+            on_progress=lambda pct: working(f"⏳ Рендер 16:9: {bar(pct)} {pct}%"),
+        )
+        done("✅ Рендер 16:9 готов")
 
     # Очистка temp
     if config.CLEANUP_TEMP_ON_SUCCESS:
