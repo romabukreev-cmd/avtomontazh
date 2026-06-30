@@ -40,7 +40,7 @@ class Session:
 class SessionManager:
 
     def scan_sessions(self) -> List[Session]:
-        """Возвращает сессии готовые к обработке (достаточно файлов экрана)."""
+        """Возвращает сессии готовые к обработке (достаточно экрана ИЛИ вебки)."""
         sessions = []
         if not config.INPUT_DIR.exists():
             log.warning(f"Папка input/ не существует: {config.INPUT_DIR}")
@@ -53,8 +53,8 @@ class SessionManager:
             screen = self._find_sorted_files(session_dir, config.SCREEN_FILE_PATTERN)
             webcam = self._find_sorted_files(session_dir, config.WEBCAM_FILE_PATTERN)
 
-            if not screen:
-                log.debug(f"Пропуск {session_dir.name}: нет файлов экрана")
+            if not screen and not webcam:
+                log.debug(f"Пропуск {session_dir.name}: нет видеофайлов")
                 continue
             if self.is_processed(session_dir.name):
                 log.debug(f"Пропуск {session_dir.name}: уже обработана")
@@ -82,21 +82,22 @@ class SessionManager:
                 return True
         return False
 
-    def concat_files(self, session: Session) -> Tuple[Path, Optional[Path]]:
+    def concat_files(self, session: Session) -> Tuple[Optional[Path], Optional[Path]]:
         """
-        Склеивает части сессии. Вебка опциональна — если нет, вернёт None.
+        Склеивает части сессии. Возвращает (screen, webcam), любой может быть None.
         """
-        if session.file_count == 1:
-            webcam = session.webcam_files[0] if session.webcam_files else None
-            return session.screen_files[0], webcam
+        has_screen = bool(session.screen_files)
+        has_webcam = bool(session.webcam_files)
+        count = max(len(session.screen_files), len(session.webcam_files))
 
-        log.info(f"Конкатенация {session.file_count} частей: {session.name}")
-        screen_out = self._concat(session.screen_files, f"{session.name}_screen_full")
+        if count == 1:
+            screen = session.screen_files[0] if has_screen else None
+            webcam = session.webcam_files[0] if has_webcam else None
+            return screen, webcam
 
-        webcam_out = None
-        if session.webcam_files:
-            webcam_out = self._concat(session.webcam_files, f"{session.name}_webcam_full")
-
+        log.info(f"Конкатенация {count} частей: {session.name}")
+        screen_out = self._concat(session.screen_files, f"{session.name}_screen_full") if has_screen else None
+        webcam_out = self._concat(session.webcam_files, f"{session.name}_webcam_full") if has_webcam else None
         return screen_out, webcam_out
 
     # ── Вспомогательные ───────────────────────────────────────────────────────

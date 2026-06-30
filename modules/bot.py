@@ -353,21 +353,19 @@ class AutomontazhBot:
             await query.edit_message_text(f"❌ Сессия '{session_name}' не найдена.")
             return
 
+        has_screen = bool(session.screen_files)
         has_webcam = bool(session.webcam_files)
-        info = f"📁 Экран: {len(session.screen_files)} файл(ов)"
-        if has_webcam:
-            info += f"\n🎥 Вебка: {len(session.webcam_files)} файл(ов)"
-        else:
-            info += "\n🎥 Вебка: нет"
+        info = f"🖥 Экран: {len(session.screen_files)} файл(ов)" if has_screen else "🖥 Экран: нет"
+        info += f"\n🎥 Вебка: {len(session.webcam_files)} файл(ов)" if has_webcam else "\n🎥 Вебка: нет"
 
         buttons = []
-        if has_webcam:
+        if has_screen and has_webcam:
             buttons.append([InlineKeyboardButton(
-                "📱 Вертикальный (9:16)",
+                "📱 Вертикальный (9:16) — экран + вебка",
                 callback_data=f"format:{session_name}:vertical",
             )])
         buttons.append([InlineKeyboardButton(
-            "🖥 Горизонтальный (16:9)",
+            "🖥 Горизонтальный (16:9)" + (" — только вебка" if not has_screen else ""),
             callback_data=f"format:{session_name}:horizontal",
         )])
 

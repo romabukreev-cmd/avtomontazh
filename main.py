@@ -220,9 +220,12 @@ def _pipeline(
     screen_file, webcam_file = session_manager.concat_files(session)
     done("✅ Файлы готовы")
 
+    # Источник для транскрипции и silencedetect — скрин если есть, иначе вебка
+    audio_source = screen_file if screen_file else webcam_file
+
     # 2. Транскрипция
     working("⏳ Транскрипция (Whisper)...")
-    segments   = transcriber.transcribe(screen_file)
+    segments   = transcriber.transcribe(audio_source)
     speech_dur = sum(s["end"] - s["start"] for s in segments)
     done(f"✅ Транскрипция: {len(segments)} сегментов ({format_duration(speech_dur)})")
 
@@ -237,7 +240,7 @@ def _pipeline(
 
     # 4. Определение тишины + удаление пауз
     working("⏳ Анализ тихих зон...")
-    silence_regions = _detect_silence(screen_file)
+    silence_regions = _detect_silence(audio_source)
     timeline = _build_timeline(kept, silence_regions=silence_regions)
     tl_dur   = sum(s["end"] - s["start"] for s in timeline)
     done(f"✅ Паузы вырезаны: {format_duration(tl_dur)}")

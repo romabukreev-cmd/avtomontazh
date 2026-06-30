@@ -58,12 +58,12 @@ class VideoRenderer:
         self,
         timeline:    List[Dict],
         output_dir:  Path,
-        screen_file: Path,
+        screen_file: Optional[Path] = None,
         webcam_file: Optional[Path] = None,
         on_progress: Optional[Callable[[int], None]] = None,
     ) -> Path:
-        """Горизонтальный 1920×1080. С вебкой — PiP в углу, без вебки — только экран."""
-        if webcam_file:
+        """Горизонтальный 1920×1080. screen+webcam → PiP, screen only → кроп экрана, webcam only → кроп вебки."""
+        if screen_file and webcam_file:
             return self._render(
                 timeline, output_dir, screen_file, webcam_file,
                 output_name="horizontal_9min.mp4",
@@ -75,10 +75,18 @@ class VideoRenderer:
                 ),
                 on_progress=on_progress,
             )
+        if screen_file:
+            return self._render_single_input(
+                timeline, output_dir, screen_file,
+                output_name="horizontal_9min.mp4",
+                filter_builder=lambda s, e: _screen_only_filter(config.SCREEN_CROP_Y, s, e),
+                on_progress=on_progress,
+            )
+        # webcam only
         return self._render_single_input(
-            timeline, output_dir, screen_file,
+            timeline, output_dir, webcam_file,
             output_name="horizontal_9min.mp4",
-            filter_builder=lambda s, e: _screen_only_filter(config.SCREEN_CROP_Y, s, e),
+            filter_builder=lambda s, e: _webcam_only_filter(s, e),
             on_progress=on_progress,
         )
 
@@ -322,5 +330,13 @@ def _screen_only_filter(crop_y: int, s: float, e: float) -> str:
     return (
         f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
         f"crop=1920:1080:0:{crop_y}[vout];"
+        f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[aout]"
+    )
+
+
+def _webcam_only_filter(s: float, e: float) -> str:
+    return (
+        f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
+        f"scale=1920:1080:flags=lanczos,setsar=1[vout];"
         f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[aout]"
     )
