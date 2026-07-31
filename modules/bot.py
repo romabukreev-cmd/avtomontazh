@@ -5,7 +5,7 @@ bot.py — Telegram-бот для управления системой Авто
   /start    — приветствие
   /sync     — скачать файлы с Google Drive
   /sessions — список сессий для обработки
-  /status   — текущий статус (обрабатывается / свободно / очередь)
+  /status   — текущий статус
   /cancel   — остановить текущую обработку
   /reset    — сбросить незавершённую сессию
 
@@ -18,7 +18,7 @@ import os
 import shutil
 import signal
 import subprocess
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from telegram import (
     BotCommand,
@@ -59,6 +59,8 @@ _BUTTON_COMMANDS = {
     "🗑 output":  "_cmd_clear_output",
 }
 
+_FMT_LABEL = {"vertical": "📱 9:16", "horizontal": "🖥 16:9"}
+
 
 class AutomontazhBot:
 
@@ -67,7 +69,8 @@ class AutomontazhBot:
         self.session_manager = SessionManager()
         self.is_processing   = False
         self.current_session: Optional[str] = None
-        self._queue: list    = []
+        # Очередь хранит (Session, format_str) tuples
+        self._queue: list[Tuple[Session, str]] = []
         self._app            = None
 
     # ── Запуск ────────────────────────────────────────────────────────────────
@@ -128,7 +131,7 @@ class AutomontazhBot:
     async def _on_keyboard_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update):
             return
-        text = (update.message.text or "").lower()
+        text   = (update.message.text or "").lower()
         method = _BUTTON_COMMANDS.get(text)
         if method:
             await getattr(self, method)(update, ctx)
@@ -153,7 +156,14 @@ class AutomontazhBot:
         except Exception as e:
             log.error(f"rclone sync: {e}")
             reply = f"❌ Ошибка синхронизации:\n<code>{e}</code>"
-        await msg.edit_text(reply, parse_mode="HTML")
+        try:
+            await msg.edit_text(reply, parse_mode="HTML")
+        except Exception as e:
+            log.warning(f"sync reply edit failed: {e}")
+            try:
+                await update.message.reply_text(reply, parse_mode="HTML")
+            except Exception:
+                log.exception("sync fallback reply failed")
 
     async def _cmd_sessions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._allowed(update):
@@ -166,9 +176,9 @@ class AutomontazhBot:
             )
             return
 
-        queued_names = {s.name for s, _ in self._queue} if self._queue else set()
+        queued_names = {s.name for s, _ in self._queue}
         status_line  = f"⏳ Сейчас: <b>{self.current_session}</b>\n" if self.is_processing else ""
-        queue_line   = ("Очередь: " + " → ".join(f"{s.name} [{f}]" for s, f in self._queue) + "\n") if self._queue else ""
+        queue_line   = ("Очередь: " + " → ".join(s.name for s, _ in self._queue) + "\n") if self._queue else ""
 
         keyboard = []
         free = [s for s in sessions if s.name not in queued_names and s.name != self.current_session]
@@ -178,15 +188,15 @@ class AutomontazhBot:
             )])
 
         for s in sessions:
+            # Иконки наличия файлов
+            icons = ("🖥" if s.has_screen else "") + ("🎥" if s.has_webcam else "")
             if s.name == self.current_session:
-                label = f"⏳ {s.name} (обрабатывается)"
+                label = f"⏳ {s.name} [{icons}] (обрабатывается)"
             elif s.name in queued_names:
                 pos   = next(i + 1 for i, (q, _) in enumerate(self._queue) if q.name == s.name)
-                label = f"#{pos} в очереди: {s.name}"
+                label = f"#{pos} в очереди: {s.name} [{icons}]"
             else:
-                n     = s.file_count
-                cam   = " + 🎥" if s.webcam_files else ""
-                label = f"{s.name}  ({n} 🖥{cam})"
+                label = f"{s.name}  [{icons}] ({s.file_count} файл(ов))"
             keyboard.append([InlineKeyboardButton(label, callback_data=f"process:{s.name}")])
 
         await update.message.reply_text(
@@ -199,14 +209,14 @@ class AutomontazhBot:
         if not self._allowed(update):
             return
         if self.is_processing:
-            q = ("\n\n⏳ Очередь: " + " → ".join(f"{s.name} [{f}]" for s, f in self._queue)) if self._queue else ""
+            q = ("\n\n⏳ Очередь: " + " → ".join(s.name for s, _ in self._queue)) if self._queue else ""
             await update.message.reply_text(
                 f"⏳ Обрабатывается: <b>{self.current_session}</b>{q}",
                 parse_mode="HTML",
             )
         else:
             sessions = self.session_manager.scan_sessions()
-            q = ("\n⏳ В очереди: " + " → ".join(f"{s.name} [{f}]" for s, f in self._queue)) if self._queue else ""
+            q = ("\n⏳ В очереди: " + " → ".join(s.name for s, _ in self._queue)) if self._queue else ""
             await update.message.reply_text(
                 f"✅ Свободно. Ожидает обработки: {len(sessions)} сессий.{q}"
             )
@@ -272,9 +282,7 @@ class AutomontazhBot:
             return
 
         msg = await update.message.reply_text("⏳ Проверяю output...")
-
         local_folders, gdrive_folders = await asyncio.to_thread(self._list_output_folders)
-
         all_names = sorted(set(local_folders) | set(gdrive_folders))
         if not all_names:
             await msg.edit_text("Папка output пуста (сервер и Google Drive).")
@@ -305,25 +313,27 @@ class AutomontazhBot:
         if not self._allowed(update):
             return
         all_sessions = self.session_manager.scan_sessions()
-        queued_names = {s.name for s, _ in self._queue} if self._queue else set()
+        queued_names = {s.name for s, _ in self._queue}
         free = [s for s in all_sessions if s.name not in queued_names and s.name != self.current_session]
         if not free:
             await query.edit_message_text("Нет свободных сессий.")
             return
+
         added = []
         for s in free:
-            fmt = "vertical" if s.webcam_files else "horizontal"
+            # Авто-формат: вертикальный если есть и экран и вебка, иначе горизонтальный
+            auto_fmt = "vertical" if (s.has_screen and s.has_webcam) else "horizontal"
             if not self.is_processing and not added:
-                fmt_label = "9:16" if fmt == "vertical" else "16:9"
                 status_msg = await self._app.bot.send_message(
                     chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
-                    text=f"▶ Начинаю: <b>{s.name}</b> [{fmt_label}]",
+                    text=f"▶ <b>{s.name}</b> [{_FMT_LABEL[auto_fmt]}]",
                     parse_mode="HTML",
                 )
-                asyncio.create_task(self._run_pipeline(s, status_msg, fmt))
+                asyncio.create_task(self._run_pipeline(s, status_msg, auto_fmt))
             else:
-                self._queue.append((s, fmt))
-            added.append(f"{s.name} [{fmt}]")
+                self._queue.append((s, auto_fmt))
+            added.append(f"{s.name} [{_FMT_LABEL[auto_fmt]}]")
+
         names = "\n".join(f"  • {n}" for n in added)
         await query.edit_message_text(
             f"✅ Запущено/в очереди ({len(added)}):\n{names}",
@@ -331,10 +341,12 @@ class AutomontazhBot:
         )
 
     async def _on_session_selected(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показывает кнопки выбора формата для выбранной сессии."""
         query = update.callback_query
         await query.answer()
         if not self._allowed(update):
             return
+
         session_name = query.data.replace("process:", "")
 
         if any(s.name == session_name for s, _ in self._queue):
@@ -353,35 +365,41 @@ class AutomontazhBot:
             await query.edit_message_text(f"❌ Сессия '{session_name}' не найдена.")
             return
 
-        has_screen = bool(session.screen_files)
-        has_webcam = bool(session.webcam_files)
-        info = f"🖥 Экран: {len(session.screen_files)} файл(ов)" if has_screen else "🖥 Экран: нет"
-        info += f"\n🎥 Вебка: {len(session.webcam_files)} файл(ов)" if has_webcam else "\n🎥 Вебка: нет"
-
+        # Строим кнопки выбора формата
         buttons = []
-        if has_screen and has_webcam:
+        if session.has_screen and session.has_webcam:
             buttons.append([InlineKeyboardButton(
                 "📱 Вертикальный (9:16) — экран + вебка",
                 callback_data=f"format:{session_name}:vertical",
             )])
+
+        h_label = "🖥 Горизонтальный (16:9)"
+        if session.has_screen and not session.has_webcam:
+            h_label += " — только экран"
+        elif session.has_webcam and not session.has_screen:
+            h_label += " — только вебка"
         buttons.append([InlineKeyboardButton(
-            "🖥 Горизонтальный (16:9)" + (" — только вебка" if not has_screen else ""),
-            callback_data=f"format:{session_name}:horizontal",
+            h_label, callback_data=f"format:{session_name}:horizontal"
         )])
 
+        icons = ("🖥 " if session.has_screen else "") + ("🎥" if session.has_webcam else "")
         await query.edit_message_text(
-            f"<b>{session_name}</b>\n{info}\n\nВыбери формат:",
+            f"<b>{session_name}</b>  {icons}\nВыбери формат вывода:",
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode="HTML",
         )
 
     async def _on_format_selected(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Запускает или ставит в очередь сессию с выбранным форматом."""
         query = update.callback_query
         await query.answer()
         if not self._allowed(update):
             return
 
-        _, session_name, output_format = query.data.split(":", 2)
+        # callback_data = "format:{session_name}:{format}"
+        # session_name может содержать спецсимволы, поэтому rsplit
+        _, rest         = query.data.split(":", 1)
+        session_name, output_format = rest.rsplit(":", 1)
 
         session = next(
             (s for s in self.session_manager.scan_sessions() if s.name == session_name),
@@ -391,28 +409,22 @@ class AutomontazhBot:
             await query.edit_message_text(f"❌ Сессия '{session_name}' не найдена.")
             return
 
-        if output_format == "vertical" and not session.webcam_files:
-            await query.edit_message_text(
-                f"❌ <b>{session_name}</b>: для вертикального формата нужна вебка.",
-                parse_mode="HTML",
-            )
-            return
+        fmt_label = _FMT_LABEL.get(output_format, output_format)
 
         if self.is_processing:
             self._queue.append((session, output_format))
-            pos = len(self._queue)
-            queue_names = " → ".join(f"{s.name} [{f}]" for s, f in self._queue)
+            pos         = len(self._queue)
+            queue_names = " → ".join(s.name for s, _ in self._queue)
             await query.edit_message_text(
-                f"✅ <b>{session_name}</b> [{output_format}] в очереди (позиция {pos}).\n\n"
+                f"✅ <b>{session_name}</b> [{fmt_label}] в очереди (позиция {pos}).\n\n"
                 f"Очередь: {queue_names}\n\n"
                 f"Начнётся после <b>{self.current_session}</b>.",
                 parse_mode="HTML",
             )
             return
 
-        fmt_label = "9:16" if output_format == "vertical" else "16:9"
         status_msg = await query.edit_message_text(
-            f"▶ Начинаю: <b>{session_name}</b> [{fmt_label}]",
+            f"▶ <b>{session_name}</b> [{fmt_label}]",
             parse_mode="HTML",
         )
         asyncio.create_task(self._run_pipeline(session, status_msg, output_format))
@@ -439,11 +451,8 @@ class AutomontazhBot:
         await query.answer()
         if not self._allowed(update):
             return
-
         await query.edit_message_text("⏳ Удаляю...")
-
         count, gdrive_fail = await asyncio.to_thread(self._delete_all_output)
-
         if gdrive_fail:
             fail_list = "\n".join(f"  • {n}" for n in gdrive_fail)
             await query.edit_message_text(
@@ -457,7 +466,12 @@ class AutomontazhBot:
 
     # ── Пайплайн ──────────────────────────────────────────────────────────────
 
-    async def _run_pipeline(self, session: Session, status_msg, output_format: str = "vertical") -> None:
+    async def _run_pipeline(
+        self,
+        session:       Session,
+        status_msg,
+        output_format: str = "vertical",
+    ) -> None:
         session_name         = session.name
         self.is_processing   = True
         self.current_session = session_name
@@ -493,8 +507,9 @@ class AutomontazhBot:
             if self._queue:
                 next_name = self._queue[0][0].name
                 q_info = f"\n\n⏳ Следующая: <b>{next_name}</b>"
+            fmt_label  = _FMT_LABEL.get(output_format, output_format)
             success_text = (
-                f"✅ <b>Готово!</b> Видео на Google Drive:\n"
+                f"✅ <b>Готово!</b> [{fmt_label}] Видео на Google Drive:\n"
                 f"<code>PROJECTS/Автомонтаж/output/{session_name}/</code>"
                 f"{q_info}"
             )
@@ -524,11 +539,10 @@ class AutomontazhBot:
             self.current_session = None
             if self._queue:
                 next_s, next_fmt = self._queue.pop(0)
-                fmt_label = "9:16" if next_fmt == "vertical" else "16:9"
                 log.info(f"Очередь: запускаю {next_s.name} [{next_fmt}]")
                 next_msg = await self._app.bot.send_message(
                     chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
-                    text=f"▶ Из очереди: <b>{next_s.name}</b> [{fmt_label}]",
+                    text=f"▶ Из очереди: <b>{next_s.name}</b> [{_FMT_LABEL.get(next_fmt, next_fmt)}]",
                     parse_mode="HTML",
                 )
                 asyncio.create_task(self._run_pipeline(next_s, next_msg, next_fmt))
@@ -545,18 +559,30 @@ class AutomontazhBot:
     def _run_rclone_sync(self) -> None:
         remote = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_INPUT_PATH}"
         local  = str(config.INPUT_DIR)
-        cmd    = ["rclone", "sync", remote, local, "--min-age", "30s", "--progress"]
+        cmd    = ["rclone", "sync", remote, local, "--min-age", "30s", "--stats", "30s"]
         log.info(f"rclone sync: {remote} → {local}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=config.RCLONE_SYNC_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"rclone sync timed out after {config.RCLONE_SYNC_TIMEOUT_SEC}s") from e
         if result.returncode != 0:
             raise RuntimeError(f"rclone sync:\n{result.stderr[-1000:]}")
 
     def _upload_output(self, session_name: str) -> None:
         local  = str(config.OUTPUT_DIR / session_name)
         remote = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}/{session_name}"
-        cmd    = ["rclone", "copy", local, remote, "--progress"]
+        cmd    = ["rclone", "copy", local, remote, "--stats", "30s"]
         log.info(f"rclone upload: {local} → {remote}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=config.RCLONE_UPLOAD_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"rclone upload timed out after {config.RCLONE_UPLOAD_TIMEOUT_SEC}s") from e
         if result.returncode != 0:
             raise RuntimeError(f"rclone upload:\n{result.stderr[-1000:]}")
 
@@ -567,29 +593,24 @@ class AutomontazhBot:
             log.info(f"Удалена входная папка: {inp}")
 
     def _list_output_folders(self) -> tuple[list[str], list[str]]:
-        """Возвращает (local_folders, gdrive_folders) — имена папок в output."""
         local_folders = []
         if config.OUTPUT_DIR.exists():
             local_folders = sorted(d.name for d in config.OUTPUT_DIR.iterdir() if d.is_dir())
-
         remote = f"{config.RCLONE_REMOTE_NAME}:{config.RCLONE_YD_OUTPUT_PATH}"
         res = subprocess.run(["rclone", "lsf", "--dirs-only", remote], capture_output=True, text=True)
         gdrive_folders = sorted(
             name.rstrip("/") for name in res.stdout.splitlines() if name.strip()
         ) if res.returncode == 0 else []
-
         return local_folders, gdrive_folders
 
     def _delete_all_output(self) -> tuple[int, list[str]]:
-        """Удаляет все папки из output локально и на GDrive. Возвращает (count, gdrive_fail)."""
         local_folders, gdrive_folders = self._list_output_folders()
-
         local_dirs = []
         if config.OUTPUT_DIR.exists():
             local_dirs = [d for d in config.OUTPUT_DIR.iterdir() if d.is_dir()]
 
         all_names = sorted(set(d.name for d in local_dirs) | set(gdrive_folders))
-        count = len(all_names)
+        count     = len(all_names)
 
         for d in local_dirs:
             shutil.rmtree(d)
