@@ -105,9 +105,11 @@ def _build_timeline(
         g_start = words[0]["start"]
         g_end   = words[0]["end"]
         for w in words[1:]:
-            if w["start"] - g_end >= config.PAUSE_CUT_SEC:
+            gap = w["start"] - g_end
+            if gap > config.PAUSE_CUT_SEC:
                 intervals.append([g_start, g_end])
-                g_start = w["start"]
+                # Оставляем PAUSE_KEEP_SEC паузы перед следующим словом
+                g_start = w["start"] - config.PAUSE_KEEP_SEC
             g_end = w["end"]
         intervals.append([g_start, g_end])
 
@@ -159,7 +161,6 @@ def _build_timeline(
 def _pipeline(
     session: Session,
     progress: Callable[[str], None],
-    output_format: str = "vertical",
 ) -> None:
     name      = session.name
     completed = []
@@ -212,20 +213,12 @@ def _pipeline(
         filled = pct // 10
         return "[" + "▓" * filled + "░" * (10 - filled) + "]"
 
-    fmt_label = "📱 9:16" if output_format == "vertical" else "🖥 16:9"
-    working(f"⏳ Рендер {fmt_label}...")
-
-    if output_format == "vertical":
-        renderer.render_vertical(
-            timeline, output_dir, screen_file, webcam_file,
-            on_progress=lambda pct: working(f"⏳ Рендер {fmt_label}: {bar(pct)} {pct}%"),
-        )
-    else:
-        renderer.render_horizontal(
-            timeline, output_dir, screen_file, webcam_file,
-            on_progress=lambda pct: working(f"⏳ Рендер {fmt_label}: {bar(pct)} {pct}%"),
-        )
-    done(f"✅ Рендер готов ({fmt_label})")
+    working("⏳ Рендер...")
+    renderer.render_vertical(
+        timeline, output_dir, screen_file, webcam_file,
+        on_progress=lambda pct: working(f"⏳ Рендер: {bar(pct)} {pct}%"),
+    )
+    done("✅ Рендер готов")
 
     if config.CLEANUP_TEMP_ON_SUCCESS:
         for f in config.TEMP_DIR.glob(f"{session.name}_*"):

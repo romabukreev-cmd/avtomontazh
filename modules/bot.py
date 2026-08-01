@@ -18,7 +18,7 @@ import os
 import shutil
 import signal
 import subprocess
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 from telegram import (
     BotCommand,
@@ -59,9 +59,6 @@ _BUTTON_COMMANDS = {
     "🗑 output":  "_cmd_clear_output",
 }
 
-_FMT_LABEL = {"vertical": "📱 9:16", "horizontal": "🖥 16:9"}
-
-
 class AutomontazhBot:
 
     def __init__(self, pipeline_fn: Callable):
@@ -69,8 +66,7 @@ class AutomontazhBot:
         self.session_manager = SessionManager()
         self.is_processing   = False
         self.current_session: Optional[str] = None
-        # Очередь хранит (Session, format_str) tuples
-        self._queue: list[Tuple[Session, str]] = []
+        self._queue: list[Session] = []
         self._app            = None
 
     # ── Запуск ────────────────────────────────────────────────────────────────
@@ -102,7 +98,6 @@ class AutomontazhBot:
         app.add_handler(CommandHandler("clear_output", self._cmd_clear_output))
 
         app.add_handler(CallbackQueryHandler(self._on_session_selected, pattern="^process:"))
-        app.add_handler(CallbackQueryHandler(self._on_format_selected,  pattern="^format:"))
         app.add_handler(CallbackQueryHandler(self._on_all_sessions,     pattern="^all_sessions$"))
         app.add_handler(CallbackQueryHandler(self._on_reset_selected,   pattern="^reset:"))
         app.add_handler(CallbackQueryHandler(self._on_clear_confirmed,  pattern="^clear_output_confirm$"))
@@ -176,9 +171,9 @@ class AutomontazhBot:
             )
             return
 
-        queued_names = {s.name for s, _ in self._queue}
+        queued_names = {s.name for s in self._queue}
         status_line  = f"⏳ Сейчас: <b>{self.current_session}</b>\n" if self.is_processing else ""
-        queue_line   = ("Очередь: " + " → ".join(s.name for s, _ in self._queue) + "\n") if self._queue else ""
+        queue_line   = ("Очередь: " + " → ".join(s.name for s in self._queue) + "\n") if self._queue else ""
 
         keyboard = []
         free = [s for s in sessions if s.name not in queued_names and s.name != self.current_session]
@@ -199,6 +194,7 @@ class AutomontazhBot:
                 label = f"{s.name}  [{icons}] ({s.file_count} файл(ов))"
             keyboard.append([InlineKeyboardButton(label, callback_data=f"process:{s.name}")])
 
+
         await update.message.reply_text(
             f"{status_line}{queue_line}Выбери сессию:",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -209,14 +205,14 @@ class AutomontazhBot:
         if not self._allowed(update):
             return
         if self.is_processing:
-            q = ("\n\n⏳ Очередь: " + " → ".join(s.name for s, _ in self._queue)) if self._queue else ""
+            q = ("\n\n⏳ Очередь: " + " → ".join(s.name for s in self._queue)) if self._queue else ""
             await update.message.reply_text(
                 f"⏳ Обрабатывается: <b>{self.current_session}</b>{q}",
                 parse_mode="HTML",
             )
         else:
             sessions = self.session_manager.scan_sessions()
-            q = ("\n⏳ В очереди: " + " → ".join(s.name for s, _ in self._queue)) if self._queue else ""
+            q = ("\n⏳ В очереди: " + " → ".join(s.name for s in self._queue)) if self._queue else ""
             await update.message.reply_text(
                 f"✅ Свободно. Ожидает обработки: {len(sessions)} сессий.{q}"
             )
@@ -313,7 +309,7 @@ class AutomontazhBot:
         if not self._allowed(update):
             return
         all_sessions = self.session_manager.scan_sessions()
-        queued_names = {s.name for s, _ in self._queue}
+        queued_names = {s.name for s in self._queue}
         free = [s for s in all_sessions if s.name not in queued_names and s.name != self.current_session]
         if not free:
             await query.edit_message_text("Нет свободных сессий.")
@@ -321,18 +317,16 @@ class AutomontazhBot:
 
         added = []
         for s in free:
-            # Авто-формат: вертикальный если есть и экран и вебка, иначе горизонтальный
-            auto_fmt = "vertical" if (s.has_screen and s.has_webcam) else "horizontal"
             if not self.is_processing and not added:
                 status_msg = await self._app.bot.send_message(
                     chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
-                    text=f"▶ <b>{s.name}</b> [{_FMT_LABEL[auto_fmt]}]",
+                    text=f"▶ <b>{s.name}</b>",
                     parse_mode="HTML",
                 )
-                asyncio.create_task(self._run_pipeline(s, status_msg, auto_fmt))
+                asyncio.create_task(self._run_pipeline(s, status_msg))
             else:
-                self._queue.append((s, auto_fmt))
-            added.append(f"{s.name} [{_FMT_LABEL[auto_fmt]}]")
+                self._queue.append(s)
+            added.append(s.name)
 
         names = "\n".join(f"  • {n}" for n in added)
         await query.edit_message_text(
@@ -341,7 +335,6 @@ class AutomontazhBot:
         )
 
     async def _on_session_selected(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Показывает кнопки выбора формата для выбранной сессии."""
         query = update.callback_query
         await query.answer()
         if not self._allowed(update):
@@ -349,8 +342,8 @@ class AutomontazhBot:
 
         session_name = query.data.replace("process:", "")
 
-        if any(s.name == session_name for s, _ in self._queue):
-            pos = next(i + 1 for i, (s, _) in enumerate(self._queue) if s.name == session_name)
+        if any(s.name == session_name for s in self._queue):
+            pos = next(i + 1 for i, s in enumerate(self._queue) if s.name == session_name)
             await query.edit_message_text(
                 f"⚠️ <b>{session_name}</b> уже в очереди (позиция {pos}).",
                 parse_mode="HTML",
@@ -365,63 +358,12 @@ class AutomontazhBot:
             await query.edit_message_text(f"❌ Сессия '{session_name}' не найдена.")
             return
 
-        # Строим кнопки выбора формата
-        buttons = []
-
-        if session.has_screen and session.has_webcam:
-            v_label = "📱 Вертикальный (9:16) — экран + вебка"
-        elif session.has_screen:
-            v_label = "📱 Вертикальный (9:16) — как есть"
-        else:
-            v_label = "📱 Вертикальный (9:16) — как есть"
-        buttons.append([InlineKeyboardButton(
-            v_label, callback_data=f"format:{session_name}:vertical"
-        )])
-
-        h_label = "🖥 Горизонтальный (16:9)"
-        if session.has_screen and not session.has_webcam:
-            h_label += " — только экран"
-        elif session.has_webcam and not session.has_screen:
-            h_label += " — только вебка"
-        buttons.append([InlineKeyboardButton(
-            h_label, callback_data=f"format:{session_name}:horizontal"
-        )])
-
-        icons = ("🖥 " if session.has_screen else "") + ("🎥" if session.has_webcam else "")
-        await query.edit_message_text(
-            f"<b>{session_name}</b>  {icons}\nВыбери формат вывода:",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="HTML",
-        )
-
-    async def _on_format_selected(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Запускает или ставит в очередь сессию с выбранным форматом."""
-        query = update.callback_query
-        await query.answer()
-        if not self._allowed(update):
-            return
-
-        # callback_data = "format:{session_name}:{format}"
-        # session_name может содержать спецсимволы, поэтому rsplit
-        _, rest         = query.data.split(":", 1)
-        session_name, output_format = rest.rsplit(":", 1)
-
-        session = next(
-            (s for s in self.session_manager.scan_sessions() if s.name == session_name),
-            None,
-        )
-        if session is None:
-            await query.edit_message_text(f"❌ Сессия '{session_name}' не найдена.")
-            return
-
-        fmt_label = _FMT_LABEL.get(output_format, output_format)
-
         if self.is_processing:
-            self._queue.append((session, output_format))
+            self._queue.append(session)
             pos         = len(self._queue)
-            queue_names = " → ".join(s.name for s, _ in self._queue)
+            queue_names = " → ".join(s.name for s in self._queue)
             await query.edit_message_text(
-                f"✅ <b>{session_name}</b> [{fmt_label}] в очереди (позиция {pos}).\n\n"
+                f"✅ <b>{session_name}</b> в очереди (позиция {pos}).\n\n"
                 f"Очередь: {queue_names}\n\n"
                 f"Начнётся после <b>{self.current_session}</b>.",
                 parse_mode="HTML",
@@ -429,10 +371,10 @@ class AutomontazhBot:
             return
 
         status_msg = await query.edit_message_text(
-            f"▶ <b>{session_name}</b> [{fmt_label}]",
+            f"▶ <b>{session_name}</b>",
             parse_mode="HTML",
         )
-        asyncio.create_task(self._run_pipeline(session, status_msg, output_format))
+        asyncio.create_task(self._run_pipeline(session, status_msg))
 
     async def _on_reset_selected(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -471,12 +413,7 @@ class AutomontazhBot:
 
     # ── Пайплайн ──────────────────────────────────────────────────────────────
 
-    async def _run_pipeline(
-        self,
-        session:       Session,
-        status_msg,
-        output_format: str = "vertical",
-    ) -> None:
+    async def _run_pipeline(self, session: Session, status_msg) -> None:
         session_name         = session.name
         self.is_processing   = True
         self.current_session = session_name
@@ -496,7 +433,7 @@ class AutomontazhBot:
                 pass
 
         try:
-            await asyncio.to_thread(self.pipeline_fn, session, sync_progress, output_format)
+            await asyncio.to_thread(self.pipeline_fn, session, sync_progress)
 
             upload_msg = await self._app.bot.send_message(
                 chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
@@ -509,12 +446,12 @@ class AutomontazhBot:
                 await asyncio.to_thread(self._delete_input, session_name)
 
             q_info = ""
+            q_info = ""
             if self._queue:
-                next_name = self._queue[0][0].name
+                next_name = self._queue[0].name
                 q_info = f"\n\n⏳ Следующая: <b>{next_name}</b>"
-            fmt_label  = _FMT_LABEL.get(output_format, output_format)
             success_text = (
-                f"✅ <b>Готово!</b> [{fmt_label}] Видео на Google Drive:\n"
+                f"✅ <b>Готово!</b> Видео на Google Drive:\n"
                 f"<code>PROJECTS/Автомонтаж/output/{session_name}/</code>"
                 f"{q_info}"
             )
@@ -543,14 +480,14 @@ class AutomontazhBot:
             self.is_processing   = False
             self.current_session = None
             if self._queue:
-                next_s, next_fmt = self._queue.pop(0)
-                log.info(f"Очередь: запускаю {next_s.name} [{next_fmt}]")
+                next_s = self._queue.pop(0)
+                log.info(f"Очередь: запускаю {next_s.name}")
                 next_msg = await self._app.bot.send_message(
                     chat_id=config.TELEGRAM_ALLOWED_CHAT_ID,
-                    text=f"▶ Из очереди: <b>{next_s.name}</b> [{_FMT_LABEL.get(next_fmt, next_fmt)}]",
+                    text=f"▶ Из очереди: <b>{next_s.name}</b>",
                     parse_mode="HTML",
                 )
-                asyncio.create_task(self._run_pipeline(next_s, next_msg, next_fmt))
+                asyncio.create_task(self._run_pipeline(next_s, next_msg))
 
     # ── Вспомогательные ───────────────────────────────────────────────────────
 
