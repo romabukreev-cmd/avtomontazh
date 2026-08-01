@@ -367,11 +367,16 @@ class AutomontazhBot:
 
         # Строим кнопки выбора формата
         buttons = []
+
         if session.has_screen and session.has_webcam:
-            buttons.append([InlineKeyboardButton(
-                "📱 Вертикальный (9:16) — экран + вебка",
-                callback_data=f"format:{session_name}:vertical",
-            )])
+            v_label = "📱 Вертикальный (9:16) — экран + вебка"
+        elif session.has_screen:
+            v_label = "📱 Вертикальный (9:16) — как есть"
+        else:
+            v_label = "📱 Вертикальный (9:16) — как есть"
+        buttons.append([InlineKeyboardButton(
+            v_label, callback_data=f"format:{session_name}:vertical"
+        )])
 
         h_label = "🖥 Горизонтальный (16:9)"
         if session.has_screen and not session.has_webcam:

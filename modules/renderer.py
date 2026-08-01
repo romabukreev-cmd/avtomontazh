@@ -47,21 +47,34 @@ class VideoRenderer:
         self,
         timeline:    List[Dict],
         output_dir:  Path,
-        screen_file: Optional[Path],
-        webcam_file: Optional[Path],
+        screen_file: Optional[Path] = None,
+        webcam_file: Optional[Path] = None,
         on_progress: Optional[Callable[[int], None]] = None,
     ) -> Path:
-        """Вертикальный 9:16 — экран сверху, вебка снизу. Оба файла обязательны."""
-        if not screen_file or not webcam_file:
-            raise RuntimeError("Вертикальный формат требует оба файла: экран и вебку.")
+        """Вертикальный 9:16.
+        • Оба файла  → compositing: экран сверху (70%), вебка снизу (30%).
+        • Один файл  → passthrough trim (файл уже в нужном формате).
+        """
+        if not screen_file and not webcam_file:
+            raise RuntimeError("Нет файлов для вертикального рендера.")
         output_path = output_dir / "vertical_9min.mp4"
-        crop_y = config.SCREEN_CROP_Y
-        self._render(
-            timeline, output_path,
-            inputs=[screen_file, webcam_file],
-            filter_fn=lambda s, e: _vertical_filter(crop_y, s, e),
-            on_progress=on_progress,
-        )
+
+        if screen_file and webcam_file:
+            crop_y = config.SCREEN_CROP_Y
+            self._render(
+                timeline, output_path,
+                inputs=[screen_file, webcam_file],
+                filter_fn=lambda s, e: _vertical_filter(crop_y, s, e),
+                on_progress=on_progress,
+            )
+        else:
+            single = screen_file or webcam_file
+            self._render(
+                timeline, output_path,
+                inputs=[single],
+                filter_fn=_passthrough_filter,
+                on_progress=on_progress,
+            )
         return output_path
 
     def render_horizontal(
@@ -266,5 +279,13 @@ def _webcam_only_filter(s: float, e: float) -> str:
     return (
         f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
         + _fill_crop("", "[vout]", _H_W, _H_H) + ";"
+        f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[aout]"
+    )
+
+
+def _passthrough_filter(s: float, e: float) -> str:
+    """[0]=уже готовый файл → trim без перекодирования композита."""
+    return (
+        f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[vout];"
         f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[aout]"
     )
